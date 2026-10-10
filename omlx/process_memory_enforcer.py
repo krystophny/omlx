@@ -1982,6 +1982,7 @@ class ProcessMemoryEnforcer:
         active, total = self._cached_executor_mlx_memory_bytes()
         now = time.monotonic()
         samples = []
+        live_samples = []
         for model_id, entry in self._engine_pool._entries.items():
             scheduler = self._resolve_scheduler(entry)
             if scheduler is None:
@@ -1994,6 +1995,13 @@ class ProcessMemoryEnforcer:
                 "peak_bytes": getattr(scheduler, "_last_mlx_peak_memory_bytes", None),
                 "age_seconds": max(0.0, now - at) if at > 0 else None,
             })
+            live = getattr(scheduler, "_memory_diagnostic_sample", None)
+            if isinstance(live, dict):
+                live_samples.append({
+                    "model_id": model_id,
+                    **{key: value for key, value in live.items() if key != "at"},
+                    "age_seconds": max(0.0, now - live["at"]),
+                })
         status.update({
             "pid": os.getpid(),
             "raw_phys_bytes": get_phys_footprint(),
@@ -2002,6 +2010,7 @@ class ProcessMemoryEnforcer:
             "mlx_active_and_pool_bytes": total,
             "unreleased_graphics_bytes": unreleased_graphics_bytes(total, fresh=False),
             "allocator_samples": samples,
+            "live_allocator_samples": live_samples,
         })
         return status
 

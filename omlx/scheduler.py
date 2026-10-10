@@ -2120,6 +2120,8 @@ class Scheduler:
         self._last_mlx_cache_memory_bytes: int = 0
         self._last_mlx_peak_memory_bytes: int = 0
         self._last_mlx_active_memory_at: float = 0.0
+        # Observation only: keep this separate from samples used by the guard.
+        self._memory_diagnostic_sample: dict | None = None
         # Component ceilings — propagated alongside the hard limit so the
         # rejection-path error message can identify which constraint is
         # binding and suggest the right remedy (close apps / raise tier /
@@ -5204,6 +5206,24 @@ class Scheduler:
             total / 1024**3,
         )
         return len(plans)
+
+    def _sample_memory_diagnostics(self) -> None:
+        """Sample on the existing MLX executor at most once per second."""
+        now = time.monotonic()
+        previous = self._memory_diagnostic_sample
+        if previous is not None and now - previous["at"] < 1.0:
+            return
+        self._memory_diagnostic_sample = {
+            "at": now,
+            "active_bytes": max(0, int(mx.get_active_memory())),
+            "pool_bytes": max(0, int(mx.get_cache_memory())),
+            "peak_bytes": max(0, int(mx.get_peak_memory())),
+            "raw_phys_bytes": int(get_phys_footprint()),
+            "graphics_bytes": int(get_graphics_footprint()),
+            "tokens_since_kv_eval": self._tokens_since_kv_cache_eval,
+            "kv_eval_interval": self._decode_eval_kv_cache_interval,
+            "tokens_since_pool_clear": getattr(self, "_tokens_since_clear_cache", 0),
+        }
 
     def _current_usage_bytes(self, *, refresh_mlx_active: bool = True) -> int:
         """Current memory usage for scheduler-side guard checks.
@@ -14004,6 +14024,10 @@ class Scheduler:
             SchedulerOutput with results of this step
         """
         output = SchedulerOutput()
+
+        if self.running or self.prefilling:
+            with suppress(Exception):
+                self._sample_memory_diagnostics()
 
         # Publish decode activity for cross-engine prefill fairness (a
         # count of 0 removes the entry, so idle engines never throttle a

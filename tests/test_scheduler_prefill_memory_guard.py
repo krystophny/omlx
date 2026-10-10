@@ -71,6 +71,29 @@ def _make_request(prompt_tokens: int = 65536) -> Request:
     return req
 
 
+def test_diagnostic_sampling_is_rate_limited_and_preserves_guard_samples():
+    scheduler = _make_scheduler()
+    with patch("omlx.scheduler.time.monotonic", side_effect=[50.0, 50.5, 51.0]), \
+         patch.object(mx, "get_active_memory", side_effect=[100, 110]) as active, \
+         patch.object(mx, "get_cache_memory", side_effect=[25, 40]), \
+         patch.object(mx, "get_peak_memory", side_effect=[140, 160]), \
+         patch("omlx.scheduler.get_phys_footprint", return_value=200), \
+         patch("omlx.scheduler.get_graphics_footprint", return_value=175):
+        for _ in range(3):
+            scheduler._sample_memory_diagnostics()
+    assert active.call_count == 2
+    assert scheduler._memory_diagnostic_sample == {
+        "at": 51.0, "active_bytes": 110, "pool_bytes": 40, "peak_bytes": 160,
+        "raw_phys_bytes": 200, "graphics_bytes": 175,
+        "tokens_since_kv_eval": 0,
+        "kv_eval_interval": scheduler._decode_eval_kv_cache_interval,
+        "tokens_since_pool_clear": 0,
+    }
+    assert scheduler._last_mlx_active_memory_bytes == 0
+    assert scheduler._last_mlx_cache_memory_bytes == 0
+    assert scheduler._last_mlx_active_memory_at == 0.0
+
+
 def test_scheduler_init_instantiates_memory_monitor():
     scheduler = _make_scheduler()
     assert isinstance(scheduler.memory_monitor, MemoryMonitor)

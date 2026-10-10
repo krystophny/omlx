@@ -25,7 +25,11 @@ from omlx.scheduler import SchedulerConfig
 def test_memory_diagnostics_keep_shared_allocator_samples_separate():
     first = SimpleNamespace(_last_mlx_active_memory_bytes=100,
         _last_mlx_cache_memory_bytes=25, _last_mlx_peak_memory_bytes=180,
-        _last_mlx_active_memory_at=45.0, get_cached_mlx_memory_bytes=lambda: 125)
+        _last_mlx_active_memory_at=45.0, get_cached_mlx_memory_bytes=lambda: 125,
+        _memory_diagnostic_sample={"at": 49.0, "active_bytes": 90,
+            "pool_bytes": 35, "peak_bytes": 180, "raw_phys_bytes": 150,
+            "graphics_bytes": 110, "tokens_since_kv_eval": 12,
+            "kv_eval_interval": 256, "tokens_since_pool_clear": 12})
     second = SimpleNamespace(_last_mlx_active_memory_bytes=80,
         _last_mlx_cache_memory_bytes=10, _last_mlx_active_memory_at=0.0,
         get_cached_mlx_memory_bytes=lambda: 90)
@@ -51,6 +55,12 @@ def test_memory_diagnostics_keep_shared_allocator_samples_separate():
         {"model_id": "second", "active_bytes": 80, "pool_bytes": 10,
          "peak_bytes": None, "age_seconds": None},
     ]
+    assert result["live_allocator_samples"] == [{
+        "model_id": "first", "active_bytes": 90, "pool_bytes": 35,
+        "peak_bytes": 180, "raw_phys_bytes": 150, "graphics_bytes": 110,
+        "tokens_since_kv_eval": 12, "kv_eval_interval": 256,
+        "tokens_since_pool_clear": 12, "age_seconds": 1.0,
+    }]
 
 
 def _make_enforcer(
