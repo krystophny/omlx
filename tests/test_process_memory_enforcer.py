@@ -22,6 +22,37 @@ from omlx.process_memory_enforcer import ProcessMemoryEnforcer, tier_reserve_byt
 from omlx.scheduler import SchedulerConfig
 
 
+def test_memory_diagnostics_keep_shared_allocator_samples_separate():
+    first = SimpleNamespace(_last_mlx_active_memory_bytes=100,
+        _last_mlx_cache_memory_bytes=25, _last_mlx_peak_memory_bytes=180,
+        _last_mlx_active_memory_at=45.0, get_cached_mlx_memory_bytes=lambda: 125)
+    second = SimpleNamespace(_last_mlx_active_memory_bytes=80,
+        _last_mlx_cache_memory_bytes=10, _last_mlx_active_memory_at=0.0,
+        get_cached_mlx_memory_bytes=lambda: 90)
+    enforcer = object.__new__(ProcessMemoryEnforcer)
+    enforcer._engine_pool = SimpleNamespace(_entries={"first": first, "second": second})
+    enforcer._resolve_scheduler = lambda entry: entry
+    enforcer.get_status = lambda: {"current_bytes": 138, "ceiling_bytes": 248}
+    with patch.object(pme.time, "monotonic", return_value=50.0), \
+         patch.object(pme, "get_phys_footprint", return_value=150), \
+         patch.object(pme, "get_graphics_footprint", return_value=110), \
+         patch.object(pme, "unreleased_graphics_bytes", return_value=12), \
+         patch.object(pme.mx, "get_active_memory", side_effect=AssertionError("MLX on event loop")):
+        result = enforcer.get_memory_diagnostics()
+    assert result["current_bytes"] == 138
+    assert result["raw_phys_bytes"] == 150
+    assert result["mlx_active_bytes"] == 100
+    assert result["mlx_active_and_pool_bytes"] == 125
+    assert result["graphics_bytes"] == 110
+    assert result["unreleased_graphics_bytes"] == 12
+    assert result["allocator_samples"] == [
+        {"model_id": "first", "active_bytes": 100, "pool_bytes": 25,
+         "peak_bytes": 180, "age_seconds": 5.0},
+        {"model_id": "second", "active_bytes": 80, "pool_bytes": 10,
+         "peak_bytes": None, "age_seconds": None},
+    ]
+
+
 def _make_enforcer(
     engine_pool,
     ceiling: int = 10 * 1024**3,
