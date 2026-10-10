@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import os
 import threading
 import time
 from array import array
@@ -1561,7 +1562,7 @@ def _get_attr_or_key(obj: Any, name: str) -> Any:
 # decode holds ~3x the unthrottled rate while the mixed-batch completion
 # time stays at parity with fairness off; 1.0 buys ~5x decode at ~16%
 # batch-completion cost.
-_DECODE_FAIR_SHARE = 0.5
+_DECODE_FAIR_SHARE = float(os.environ.get("OMLX_DECODE_FAIR_SHARE", "0.5"))
 # Contended chunks are sized in TIME, not tokens: a chunk is the victim's
 # decode stall, and stall tolerance is a human constant while tokens/second
 # is a machine constant. The cap in tokens is derived per engine from the
@@ -7493,7 +7494,11 @@ class Scheduler:
         # Add grammar constraint processor for structured output.
         # Reasoning-aware grammars handle thinking/output phases through
         # structural tags; bare grammars constrain output immediately.
-        if sampling_params.compiled_grammar is not None:
+        if getattr(sampling_params.compiled_grammar, "is_label_logprob_capture", False):
+            # System One readout (server._LabelLogprobCapture): a plain logits
+            # processor that must see raw logits, so it runs before penalties.
+            logits_processors.insert(0, sampling_params.compiled_grammar)
+        elif sampling_params.compiled_grammar is not None:
             try:
                 from .api.grammar import GrammarConstraintProcessor
 

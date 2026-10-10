@@ -4502,6 +4502,371 @@ def _apply_preserve_thinking_default(
         merged_ct_kwargs["preserve_thinking"] = True
 
 
+def _native_engine_state(engine):
+    """Inspect loaded objects only; never import/construct/load a model."""
+    import sys
+
+    core = getattr(getattr(engine, "_engine", None), "engine", None)
+    scheduler = getattr(core, "scheduler", None)
+    config = getattr(scheduler, "config", None)
+    slots = getattr(config, "max_num_seqs", None)
+    batch = getattr(config, "completion_batch_size", None)
+    capacity = min(slots, batch) if type(slots) is int and slots > 0 and type(batch) is int and batch > 0 else None
+    ownership_ready = (
+        core is not None and getattr(core, "_owns_model", False) is True
+        and getattr(core, "_closed", True) is False
+        and getattr(core, "_closing", True) is False
+    )
+    state = {"effective_ple_resident": None, "effective_mmap": None,
+             "physical_capacity": capacity, "ownership_ready": ownership_ready}
+    # The live model uses oMLX's vendored qwen4_exp; stock mlx_vlm lacks DiskBackedShardedEmbedding.
+    module = (sys.modules.get("omlx.patches.mlx_vlm_qwen4_exp_compat.vendor.mlx_vlm.models.qwen4_exp.language")
+              or sys.modules.get("mlx_vlm.models.qwen4_exp.language"))
+    resident_type = getattr(module, "ShardedEmbedding", None)
+    mmap_type = getattr(module, "DiskBackedShardedEmbedding", None)
+    if not isinstance(resident_type, type) or not isinstance(mmap_type, type):
+        state["why"] = "step1"; return state
+    model = getattr(engine, "_model", None) or getattr(engine, "_vlm_model", None)
+    language = getattr(model, "language_model", model)
+    backbone = getattr(language, "model", None)
+    layers = getattr(backbone, "layers", None)
+    ple_ids = getattr(getattr(language, "args", None), "ple_layer_ids", None)
+    if not isinstance(layers, (list, tuple)) or not isinstance(ple_ids, (list, tuple)) or not ple_ids:
+        state["why"] = "step2"; return state
+    if any(type(index) is not int or index < 1 or index > len(layers) for index in ple_ids):
+        state["why"] = "step3"; return state
+    embeddings = [getattr(getattr(getattr(layers[index - 1], "ple", None), "ple_embedding", None), "ngram_embedding", None) for index in ple_ids]
+    if any(not isinstance(embedding, (resident_type, mmap_type)) for embedding in embeddings):
+        state["why"] = "step4"; return state
+    mmap = any(isinstance(embedding, mmap_type) for embedding in embeddings)
+    state["effective_mmap"] = mmap
+    state["effective_ple_resident"] = not mmap and all(isinstance(embedding, resident_type) for embedding in embeddings)
+    return state
+
+
+def _native_ready_entry(model):
+    entry = get_engine_pool().get_entry(model)
+    if entry is None or entry.engine is None or not getattr(entry.engine, "_loaded", False):
+        raise HTTPException(status_code=503, detail="native_model_not_loaded")
+    if entry.is_loading or entry.abort_requested or entry.pending_unload_reason:
+        raise HTTPException(status_code=503, detail="native_model_not_ready")
+    if not hasattr(entry.engine, "render_native_chat_prompt"):
+        raise HTTPException(status_code=503, detail="native_renderer_unavailable")
+    state = _native_engine_state(entry.engine)
+    if state["effective_ple_resident"] is not True or state["effective_mmap"] is not False or state["physical_capacity"] != 8 or not state["ownership_ready"]:
+        raise HTTPException(status_code=503, detail="native_runtime_state_unverified " + json.dumps(state, sort_keys=True, default=str))
+    return entry
+
+
+@app.post("/internal/native-prepare")
+async def native_prepare(http_request: FastAPIRequest):
+    """Private loaded-engine count; never loads a model or permits fallback."""
+    import hashlib
+    import hmac
+    import ipaddress
+
+    key_path = os.environ.get("SLOPCODE_NATIVE_PREPARE_KEY_FILE")
+    identity_path = os.environ.get("SLOPCODE_NATIVE_IDENTITY_FILE")
+    if not key_path or not identity_path:
+        raise HTTPException(status_code=404)
+    host = http_request.client.host if http_request.client else ""
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise HTTPException(status_code=403)
+    key_file = Path(key_path)
+    if key_file.stat().st_mode & 0o077:
+        raise HTTPException(status_code=503, detail="native_key_permissions")
+    key = key_file.read_bytes().strip()
+    if len(key) < 16 or not hmac.compare_digest(
+        http_request.headers.get("Authorization", "").encode(), b"Bearer " + key
+    ):
+        raise HTTPException(status_code=401)
+    payload = await http_request.json()
+    # A raw-prompt (FIM /v1/completions) request is distinguished purely by
+    # "prompt" instead of "messages": Slopgate's native adapter
+    # (omlx_native_renderer.py) forwards the client body unchanged, so this
+    # is exactly the shape /v1/completions itself would receive.
+    is_native_completion = "prompt" in payload and "messages" not in payload
+    if is_native_completion:
+        request = CompletionRequest.model_validate(payload)
+        if not isinstance(request.prompt, str):
+            raise HTTPException(status_code=400, detail="native_non_string_prompt")
+    else:
+        request = ChatCompletionRequest.model_validate(payload)
+        # File preprocessing can access remote resources; native text route forbids it.
+        for message in request.messages:
+            if isinstance(message.content, list) and any(
+                # image_url / image / input_image parts are handed to the loaded
+                # VLM engine's own processor for exact expansion; every other
+                # non-text part (files, audio, video) still forbids the remote
+                # fetch/preprocessing native admission never runs.
+                part.type not in ("text", "image_url", "image", "input_image")
+                for part in message.content
+            ):
+                raise HTTPException(status_code=400, detail="native_text_only")
+    identity = json.loads(Path(identity_path).read_text())
+    required = ("model_digest", "renderer_digest", "model_revision", "tokenizer_digest",
+                "template_digest", "representation", "runtime_version", "physical_model", "model_path")
+    if any(not identity.get(field) for field in required) or request.model != identity["physical_model"]:
+        raise HTTPException(status_code=503, detail="native_identity_unverified")
+    entry = _native_ready_entry(request.model)
+    if Path(entry.model_path).resolve() != Path(identity["model_path"]).resolve():
+        raise HTTPException(status_code=503, detail="native_checkpoint_changed")
+    tokenizer_digest = hashlib.sha256(
+        entry.engine.tokenizer.backend_tokenizer.to_str().encode()
+    ).hexdigest()
+    if identity["tokenizer_digest"] != tokenizer_digest:
+        raise HTTPException(status_code=503, detail="native_tokenizer_changed")
+    template_digest = hashlib.sha256(entry.engine.tokenizer.chat_template.encode()).hexdigest()
+    if identity["template_digest"] != template_digest:
+        raise HTTPException(status_code=503, detail="native_template_changed")
+    # Synchronous lease protects this already loaded engine during preprocessing.
+    entry.in_use += 1
+    try:
+        if is_native_completion:
+            # Mirrors /v1/completions' own tokenization exactly
+            # (create_completion above): engine.tokenizer.encode(prompt),
+            # no chat template, so a cross-node re-prepare of the same raw
+            # prompt string yields an identical prompt_tokens/token_digest.
+            tokens = list(entry.engine.tokenizer.encode(request.prompt))
+        else:
+            _, _, _, tokens = await _prepare_native_openai_chat(request, entry.engine, request.model)
+        if await http_request.is_disconnected():
+            raise HTTPException(status_code=499, detail="native_preparation_cancelled")
+        _native_ready_entry(request.model)
+        digest = hashlib.sha256(json.dumps(list(tokens), separators=(",", ":")).encode()).hexdigest()
+        return {"prompt_tokens": len(tokens), "token_digest": digest, "identity": identity,
+                "engine_state": _native_engine_state(entry.engine)}
+    finally:
+        entry.in_use -= 1
+
+
+
+
+async def _prepare_native_openai_chat(request, engine, resolved_model):
+    """Shared preprocessing for native admission and OpenAI generation."""
+    # Get per-model settings
+    max_tool_result_tokens = None
+    reasoning_parser = None
+    settings_guided_grammar = None
+    ms = get_model_settings_for_request(request.model)
+    if ms:
+        max_tool_result_tokens = ms.max_tool_result_tokens
+        reasoning_parser = ms.reasoning_parser
+        settings_guided_grammar = _settings_guided_grammar(ms)
+    merged_ct_kwargs, thinking_budget = _merge_chat_template_kwargs(request, ms)
+
+    chat_messages = _extract_chat_messages(
+        request, engine, resolved_model, max_tool_result_tokens
+    )
+    messages = chat_messages.messages
+    is_partial = chat_messages.is_partial
+    native_reasoning = chat_messages.native_reasoning
+
+    # Compile grammar for structured output (logit-level enforcement).
+    # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
+    response_format = request.response_format
+    guided_grammar = _effective_guided_grammar(
+        structured_outputs=request.structured_outputs,
+        response_format=response_format,
+        request_guided_grammar=request.guided_grammar,
+        settings_guided_grammar=settings_guided_grammar,
+    )
+    structured_outputs = _normalize_structured_outputs(
+        request.structured_outputs,
+        guided_grammar,
+    )
+    _reject_diffusion_structured_outputs(
+        engine,
+        response_format=response_format,
+        structured_outputs=structured_outputs,
+        guided_grammar=guided_grammar,
+    )
+    if structured_outputs is not None or response_format:
+        await engine.start()
+    compiled_grammar = _compile_grammar_for_request(
+        engine,
+        structured_outputs=structured_outputs,
+        response_format=response_format,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        reasoning_parser=reasoning_parser,
+    )
+    # Fall back to prompt injection when grammar is not compiled. The degrade
+    # is also surfaced to the caller as a Warning response header (#1241).
+    # Only response formats that actually request grammar-constrained JSON
+    # (json_object / json_schema) can be "unenforced"; a plain text format
+    # never asked for enforcement, so it must not warn (#1241 review).
+    response_format_warning = None
+    if compiled_grammar is None and _response_format_requests_grammar(
+        response_format
+    ):
+        response_format_warning = _response_format_warning_header(response_format)
+        json_instruction = build_json_system_prompt(response_format)
+        if json_instruction:
+            messages = _inject_json_instruction(messages, json_instruction)
+
+    tools_for_template = _resolve_template_tools(request, engine, resolved_model)
+    # Resolve template defaults before preparing the prompt for reuse.
+    _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
+    await _ensure_tokenizer_for_system_probe(engine, messages)
+    messages = prepare_system_messages_for_template(
+        messages,
+        engine.tokenizer,
+        tools=tools_for_template,
+        chat_template_kwargs=merged_ct_kwargs or None,
+        is_partial=is_partial,
+        merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
+        unsupported_mid_system_policy=_unsupported_mid_system_policy(),
+    )
+    native = bool(os.environ.get("SLOPCODE_NATIVE_PREPARE_KEY_FILE"))
+    prepared_prompt = None
+    if not native:
+        # Validate context window before sending to model
+        try:
+            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
+                engine,
+                messages,
+                tools_for_template,
+                chat_template_kwargs=merged_ct_kwargs or None,
+                is_partial=is_partial,
+            )
+        except Exception as e:
+            if _is_chat_template_error(e):
+                raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
+            raise
+        validate_context_window(num_prompt_tokens, request.model)
+
+    # Prepare kwargs
+    (
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        min_p,
+        presence_penalty,
+        frequency_penalty,
+        max_tokens,
+        xtc_probability,
+        xtc_threshold,
+    ) = get_sampling_params(
+        request.temperature,
+        request.top_p,
+        request.model,
+        req_top_k=getattr(request, "top_k", None),
+        req_repetition_penalty=getattr(request, "repetition_penalty", None),
+        req_min_p=getattr(request, "min_p", None),
+        req_presence_penalty=getattr(request, "presence_penalty", None),
+        req_frequency_penalty=getattr(request, "frequency_penalty", None),
+        req_max_tokens=request.max_tokens,
+        req_xtc_probability=getattr(request, "xtc_probability", None),
+        req_xtc_threshold=getattr(request, "xtc_threshold", None),
+    )
+    chat_kwargs = {
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+        "xtc_probability": xtc_probability,
+        "xtc_threshold": xtc_threshold,
+    }
+
+    # Widen the repetition-penalty look-back window when the client
+    # asks for it (mlx-lm default window is 20 tokens).
+    repetition_context_size = getattr(
+        request, "repetition_context_size", None
+    )
+    if repetition_context_size is not None:
+        chat_kwargs["repetition_context_size"] = repetition_context_size
+
+    # Add seed for reproducible generation (best-effort)
+    if request.seed is not None:
+        chat_kwargs["seed"] = request.seed
+
+    # Add thinking budget if applicable
+    if thinking_budget is not None:
+        chat_kwargs["thinking_budget"] = thinking_budget
+
+    if prepared_prompt is not None:
+        chat_kwargs["_prepared_prompt"] = prepared_prompt
+
+    # Add compiled grammar for logit-level structured output.
+    # When a reasoning_parser is configured, the structural tag includes
+    # a thinking phase — auto-set a thinking_budget so the model exits
+    # the reasoning phase and the grammar can activate.
+    if compiled_grammar is not None:
+        chat_kwargs["compiled_grammar"] = compiled_grammar
+        if reasoning_parser and "thinking_budget" not in chat_kwargs:
+            default_budget = min(max_tokens // 2, 4096)
+            chat_kwargs["thinking_budget"] = default_budget
+            logger.debug(
+                "Auto-set thinking_budget=%d for grammar-constrained request",
+                default_budget,
+            )
+
+    # Add tools if provided (includes MCP tools)
+    if tools_for_template:
+        chat_kwargs["tools"] = tools_for_template
+
+    # Add chat template kwargs
+    if merged_ct_kwargs:
+        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+    # Forward partial-mode decision to the engine explicitly
+    chat_kwargs["is_partial"] = is_partial
+    chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
+        ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
+    )
+
+    # SpecPrefill: per-request overrides (fall back to model_settings)
+    if request.specprefill is not None:
+        chat_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+    elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
+        chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
+    if getattr(request, "specprefill_threshold", None) is not None:
+        chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
+    elif _server_state.settings_manager and ms.specprefill_threshold is not None:
+        chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
+
+    if request.stop:
+        chat_kwargs["stop"] = request.stop
+    tokens = None
+    if native:
+        try:
+            if hasattr(engine, "render_native_chat_tokens"):
+                # VLM engine: exact expanded ids, image placeholders included,
+                # via the same processor path real inference tokenizes with.
+                tokens = engine.render_native_chat_tokens(
+                    messages, tools_for_template,
+                    chat_template_kwargs=merged_ct_kwargs or None, is_partial=is_partial,
+                )
+            else:
+                prompt = engine.render_native_chat_prompt(
+                    messages, tools_for_template,
+                    chat_template_kwargs=merged_ct_kwargs or None, is_partial=is_partial,
+                )
+                tokens = engine.tokenizer.encode(prompt)
+        except Exception as e:
+            if _is_chat_template_error(e):
+                raise HTTPException(status_code=400, detail=f"Chat template error: {e}") from e
+            raise
+        max_output = chat_kwargs["max_tokens"]
+        if not isinstance(max_output, int) or not 1 <= max_output <= 32768:
+            raise HTTPException(status_code=400, detail="native_output_budget")
+        if len(tokens) + max_output > 262144:
+            raise HTTPException(status_code=400, detail="native_context_budget")
+        validate_context_window(len(tokens), request.model)
+    return messages, chat_kwargs, response_format_warning, tokens
+
+
 @app.post("/v1/chat/completions")
 async def create_chat_completion(
     request: ChatCompletionRequest,
@@ -4562,193 +4927,15 @@ async def create_chat_completion(
         # Use the exact model selected by the pool, including fallback.
         resolved_model = _serving_model_id(lease, request.model)
 
-        # Get per-model settings
-        max_tool_result_tokens = None
-        reasoning_parser = None
-        settings_guided_grammar = None
-        ms = get_model_settings_for_request(request.model)
-        if ms:
-            max_tool_result_tokens = ms.max_tool_result_tokens
-            reasoning_parser = ms.reasoning_parser
-            settings_guided_grammar = _settings_guided_grammar(ms)
-        merged_ct_kwargs, thinking_budget = _merge_chat_template_kwargs(request, ms)
-
-        chat_messages = _extract_chat_messages(
-            request, engine, resolved_model, max_tool_result_tokens
-        )
-        messages = chat_messages.messages
-        is_partial = chat_messages.is_partial
-        native_reasoning = chat_messages.native_reasoning
-
-        # Compile grammar for structured output (logit-level enforcement).
-        # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
+        if os.environ.get("SLOPCODE_NATIVE_PREPARE_KEY_FILE"):
+            _native_ready_entry(request.model)
+        messages, chat_kwargs, response_format_warning, _ = await _prepare_native_openai_chat(
+            request, engine, resolved_model)
+        # The shared native preparation owns these; the later paths read them.
+        tools_for_template = chat_kwargs.get("tools")
+        max_tokens = chat_kwargs.get("max_tokens")
         response_format = request.response_format
-        guided_grammar = _effective_guided_grammar(
-            structured_outputs=request.structured_outputs,
-            response_format=response_format,
-            request_guided_grammar=request.guided_grammar,
-            settings_guided_grammar=settings_guided_grammar,
-        )
-        structured_outputs = _normalize_structured_outputs(
-            request.structured_outputs,
-            guided_grammar,
-        )
-        _reject_diffusion_structured_outputs(
-            engine,
-            response_format=response_format,
-            structured_outputs=structured_outputs,
-            guided_grammar=guided_grammar,
-        )
-        if structured_outputs is not None or response_format:
-            await engine.start()
-        compiled_grammar = _compile_grammar_for_request(
-            engine,
-            structured_outputs=structured_outputs,
-            response_format=response_format,
-            chat_template_kwargs=merged_ct_kwargs or None,
-            reasoning_parser=reasoning_parser,
-        )
-        # Fall back to prompt injection when grammar is not compiled. The degrade
-        # is also surfaced to the caller as a Warning response header (#1241).
-        # Only response formats that actually request grammar-constrained JSON
-        # (json_object / json_schema) can be "unenforced"; a plain text format
-        # never asked for enforcement, so it must not warn (#1241 review).
-        response_format_warning = None
-        if compiled_grammar is None and _response_format_requests_grammar(
-            response_format
-        ):
-            response_format_warning = _response_format_warning_header(response_format)
-            json_instruction = build_json_system_prompt(response_format)
-            if json_instruction:
-                messages = _inject_json_instruction(messages, json_instruction)
 
-        tools_for_template = _resolve_template_tools(request, engine, resolved_model)
-        # Resolve template defaults before preparing the prompt for reuse.
-        _apply_preserve_thinking_default(resolved_model, merged_ct_kwargs)
-        await _ensure_tokenizer_for_system_probe(engine, messages)
-        messages = prepare_system_messages_for_template(
-            messages,
-            engine.tokenizer,
-            tools=tools_for_template,
-            chat_template_kwargs=merged_ct_kwargs or None,
-            is_partial=is_partial,
-            merge_consecutive_roles=chat_messages.merge_system_fallback_roles,
-            unsupported_mid_system_policy=_unsupported_mid_system_policy(),
-        )
-        # Validate context window before sending to model
-        try:
-            num_prompt_tokens, prepared_prompt = _prepare_chat_prompt_for_request(
-                engine,
-                messages,
-                tools_for_template,
-                chat_template_kwargs=merged_ct_kwargs or None,
-                is_partial=is_partial,
-            )
-        except Exception as e:
-            if _is_chat_template_error(e):
-                raise HTTPException(status_code=400, detail=f"Chat template error: {e}")
-            raise
-        validate_context_window(num_prompt_tokens, request.model)
-
-        # Prepare kwargs
-        (
-            temperature,
-            top_p,
-            top_k,
-            repetition_penalty,
-            min_p,
-            presence_penalty,
-            frequency_penalty,
-            max_tokens,
-            xtc_probability,
-            xtc_threshold,
-        ) = get_sampling_params(
-            request.temperature,
-            request.top_p,
-            request.model,
-            req_top_k=getattr(request, "top_k", None),
-            req_repetition_penalty=getattr(request, "repetition_penalty", None),
-            req_min_p=getattr(request, "min_p", None),
-            req_presence_penalty=getattr(request, "presence_penalty", None),
-            req_frequency_penalty=getattr(request, "frequency_penalty", None),
-            req_max_tokens=request.max_tokens,
-            req_xtc_probability=getattr(request, "xtc_probability", None),
-            req_xtc_threshold=getattr(request, "xtc_threshold", None),
-        )
-        chat_kwargs = {
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "top_k": top_k,
-            "min_p": min_p,
-            "repetition_penalty": repetition_penalty,
-            "presence_penalty": presence_penalty,
-            "frequency_penalty": frequency_penalty,
-            "xtc_probability": xtc_probability,
-            "xtc_threshold": xtc_threshold,
-        }
-
-        # Widen the repetition-penalty look-back window when the client
-        # asks for it (mlx-lm default window is 20 tokens).
-        repetition_context_size = getattr(
-            request, "repetition_context_size", None
-        )
-        if repetition_context_size is not None:
-            chat_kwargs["repetition_context_size"] = repetition_context_size
-
-        # Add seed for reproducible generation (best-effort)
-        if request.seed is not None:
-            chat_kwargs["seed"] = request.seed
-
-        # Add thinking budget if applicable
-        if thinking_budget is not None:
-            chat_kwargs["thinking_budget"] = thinking_budget
-
-        if prepared_prompt is not None:
-            chat_kwargs["_prepared_prompt"] = prepared_prompt
-
-        # Add compiled grammar for logit-level structured output.
-        # When a reasoning_parser is configured, the structural tag includes
-        # a thinking phase — auto-set a thinking_budget so the model exits
-        # the reasoning phase and the grammar can activate.
-        if compiled_grammar is not None:
-            chat_kwargs["compiled_grammar"] = compiled_grammar
-            if reasoning_parser and "thinking_budget" not in chat_kwargs:
-                default_budget = min(max_tokens // 2, 4096)
-                chat_kwargs["thinking_budget"] = default_budget
-                logger.debug(
-                    "Auto-set thinking_budget=%d for grammar-constrained request",
-                    default_budget,
-                )
-
-        # Add tools if provided (includes MCP tools)
-        if tools_for_template:
-            chat_kwargs["tools"] = tools_for_template
-
-        # Add chat template kwargs
-        if merged_ct_kwargs:
-            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-
-        # Forward partial-mode decision to the engine explicitly
-        chat_kwargs["is_partial"] = is_partial
-        chat_kwargs["preserve_reasoning"] = cache_reasoning_output(
-            ms, native_reasoning=native_reasoning, chat_template_kwargs=merged_ct_kwargs
-        )
-
-        # SpecPrefill: per-request overrides (fall back to model_settings)
-        if request.specprefill is not None:
-            chat_kwargs["specprefill"] = request.specprefill
-        if request.specprefill_keep_pct is not None:
-            chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-        elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
-            chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
-        if getattr(request, "specprefill_threshold", None) is not None:
-            chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
-        elif _server_state.settings_manager and ms.specprefill_threshold is not None:
-            chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
-
-        if request.stop:
-            chat_kwargs["stop"] = request.stop
 
         # Pre-flight prefill memory guard. Must run BEFORE either branch wraps
         # the response in a StreamingResponse — starlette emits
@@ -4805,6 +4992,11 @@ async def create_chat_completion(
                 headers=sse_headers,
             )
 
+        label_capture = _label_logprob_capture(engine, await http_request.json())
+        if label_capture is not None:
+            if chat_kwargs.get("compiled_grammar") is not None:
+                raise HTTPException(status_code=400, detail="label_logprobs_with_response_format")
+            chat_kwargs["compiled_grammar"] = label_capture
         # Non-streaming response with keepalive during prefill
         async def _build_chat_completion():
             await _raise_if_llm_lease_abort_requested(lease)
@@ -4911,7 +5103,7 @@ async def create_chat_completion(
 
             finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
-            return ChatCompletionResponse(
+            response_json = ChatCompletionResponse(
                 model=request.model,
                 choices=[
                     ChatCompletionChoice(
@@ -4948,6 +5140,7 @@ async def create_chat_completion(
                     ),
                 ),
             ).model_dump_json(exclude_none=True)
+            return _attach_label_logprobs(response_json, label_capture)
 
         json_headers = (
             {"Warning": response_format_warning} if response_format_warning else None
@@ -4960,6 +5153,66 @@ async def create_chat_completion(
         await lease.release()
         raise
 
+
+class _LabelLogprobCapture:
+    """First-step logits processor for System One label readouts.
+
+    Travels in SamplingParams.compiled_grammar; the scheduler puts it first
+    in the processor list instead of compiling a grammar. It records each
+    label's log-probability under the raw first-step logits and then
+    restricts sampling to the labels.
+    """
+
+    is_label_logprob_capture = True
+
+    def __init__(self, labels, token_ids):
+        self.labels = labels
+        self.token_ids = token_ids
+        self.values = None
+        self._mask = None
+
+    def __call__(self, tokens, logits):
+        import mlx.core as mx
+        import numpy as np
+
+        if self.values is None:
+            row = logits.reshape(-1, logits.shape[-1])[-1].astype(mx.float32)
+            self.values = (row[mx.array(self.token_ids)] - mx.logsumexp(row)).tolist()
+        if self._mask is None or self._mask.shape[-1] != logits.shape[-1]:
+            mask = np.full(logits.shape[-1], -np.inf, dtype=np.float32)
+            mask[self.token_ids] = 0.0
+            self._mask = mx.array(mask)
+        return logits + self._mask
+
+
+def _label_logprob_capture(engine, payload):
+    labels = payload.get("label_logprobs") if isinstance(payload, dict) else None
+    if labels is None:
+        return None
+    if (
+        not isinstance(labels, list)
+        or not 1 <= len(labels) <= 64
+        or len(set(labels)) != len(labels)
+        or not all(isinstance(label, str) and label for label in labels)
+    ):
+        raise HTTPException(status_code=400, detail="invalid_label_logprobs")
+    token_ids = []
+    for label in labels:
+        encoded = list(engine.tokenizer.encode(label, add_special_tokens=False))
+        if len(encoded) != 1:
+            raise HTTPException(status_code=400, detail="label_not_single_token")
+        token_ids.append(int(encoded[0]))
+    return _LabelLogprobCapture(labels, token_ids)
+
+
+def _attach_label_logprobs(response_json, capture):
+    if capture is None:
+        return response_json
+    if capture.values is None:
+        raise HTTPException(status_code=502, detail="label_logprobs_not_captured")
+    data = json.loads(response_json)
+    data["label_logprobs"] = dict(zip(capture.labels, capture.values))
+    return json.dumps(data)
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:
     """

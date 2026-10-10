@@ -937,6 +937,21 @@ class BatchedEngine(BaseEngine):
             prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
             return prompt + "\nassistant:"
 
+    def render_native_chat_prompt(self, messages, tools=None, chat_template_kwargs=None, is_partial=None):
+        """Render the exact prompt used by chat, preflight and native admission."""
+        messages = self._preprocess_messages(messages)
+        template_tools = convert_tools_for_template(tools) if tools else None
+        return self._render_preprocessed_chat_prompt(
+            messages, template_tools, chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
+    def _render_preprocessed_chat_prompt(self, messages, template_tools, chat_template_kwargs=None, is_partial=None):
+        return self._apply_chat_template(
+            messages, template_tools, chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],

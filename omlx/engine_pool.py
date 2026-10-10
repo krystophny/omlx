@@ -17,6 +17,7 @@ import asyncio
 import copy
 import gc
 import json
+import os
 import logging
 import time
 from collections import OrderedDict
@@ -368,6 +369,14 @@ class EnginePool:
         # Scanned model roots, kept for org-qualified display/upload names.
         self._model_dirs: list[Path] = []
         self._scheduler_config = scheduler_config or SchedulerConfig()
+        if os.environ.get("SLOPCODE_NATIVE_PREPARE_KEY_FILE"):
+            from .native_identity import scope_native_cache
+
+            identity_path = os.environ.get("SLOPCODE_NATIVE_IDENTITY_FILE")
+            if not identity_path:
+                raise ValueError("native_identity_file_required")
+            identity = json.loads(Path(identity_path).read_text())
+            self._scheduler_config = scope_native_cache(self._scheduler_config, identity)
         self._process_memory_enforcer: object | None = None  # Set by server
         self._get_final_ceiling: object | None = None  # Set by server
         self._get_admission_ceiling: object | None = None  # Set by server

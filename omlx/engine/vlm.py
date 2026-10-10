@@ -5920,6 +5920,91 @@ class VLMBatchedEngine(BaseEngine):
                 self._diffusion_cancel_events.discard(cancel_event)
                 self._diffusion_active_requests -= 1
 
+    def render_native_chat_prompt(self, messages, tools=None, chat_template_kwargs=None, is_partial=None):
+        """Render the text prompt used by chat, preflight and native admission."""
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+        text_messages, _, _ = extract_images_from_messages(media_messages)
+        template_tools = convert_tools_for_template(tools) if tools else None
+        return self._apply_chat_template(
+            text_messages,
+            template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
+        )
+
+    def render_native_chat_tokens(self, messages, tools=None, chat_template_kwargs=None, is_partial=None):
+        """Exact prompt token ids for native admission, image tokens included.
+
+        Mirrors the first half of ``_prepare_vision_inputs`` (chat-template
+        formatting + mlx_vlm's ``prepare_inputs`` tokenize/preprocess step)
+        so the returned ids are byte-identical to what real inference will
+        prefill, without running the vision tower (no
+        ``_compute_vision_features`` call, which only happens later, gated
+        on ``has_multimodal`` in that function). Text-only requests fall
+        back to ``render_native_chat_prompt`` + ``tokenizer.encode``
+        unchanged. Audio is rejected: native admission covers image input
+        only. Does not replicate the ``SINGLE_IMAGE_ONLY_MODELS`` guard from
+        ``_prepare_vision_inputs``; the pinned qwen4_exp model is not on
+        that list.
+        """
+        from mlx_vlm.utils import prepare_inputs
+
+        media_messages = messages
+        model_type = self.model_type or _read_config_model_type(self._model_name)
+        if model_type in {"mimo_v2", "mimo_v2_flash"}:
+            media_messages = expand_video_parts(messages)
+        text_messages, images, audio = extract_images_from_messages(media_messages)
+        if not images and not audio:
+            prompt = self.render_native_chat_prompt(
+                messages, tools, chat_template_kwargs=chat_template_kwargs, is_partial=is_partial,
+            )
+            return self._tokenizer.encode(prompt)
+        if audio:
+            raise InvalidRequestError(
+                "Native admission does not support audio input.", field="messages",
+            )
+        num_images = len(images)
+        formatted_messages, _ = self._format_messages_for_vlm_template(
+            text_messages, num_images=num_images, num_audios=0,
+        )
+        if is_partial is None:
+            is_partial = detect_and_strip_partial(messages)
+        detect_and_strip_partial(formatted_messages)
+        template_kwargs = {"tokenize": False, "add_generation_prompt": not is_partial}
+        if is_partial:
+            template_kwargs["continue_final_message"] = True
+        if self._enable_thinking is not None:
+            template_kwargs["enable_thinking"] = self._enable_thinking
+        template_tools = convert_tools_for_template(tools) if tools else None
+        if template_tools:
+            template_kwargs["tools"] = template_tools
+        if chat_template_kwargs:
+            template_kwargs.update(chat_template_kwargs)
+        _apply_minimax_m3_thinking_mode(model_type, template_kwargs)
+        template_target = self._processor
+        if not hasattr(template_target, "apply_chat_template"):
+            template_target = getattr(self._processor, "tokenizer", self._processor)
+        try:
+            prompt = apply_chat_template_with_reasoning_effort_fallback(
+                template_target, formatted_messages, template_kwargs,
+                is_harmony=model_type == "gpt_oss",
+            )
+        except TypeError:
+            if chat_template_kwargs:
+                for key in chat_template_kwargs:
+                    template_kwargs.pop(key, None)
+            template_kwargs.pop("enable_thinking", None)
+            prompt = template_target.apply_chat_template(formatted_messages, **template_kwargs)
+        inputs = prepare_inputs(
+            self._processor, images=images, audio=None,
+            prompts=[prompt] if isinstance(prompt, str) else prompt,
+        )
+        input_ids = inputs["input_ids"]
+        return input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
+
     def count_chat_tokens(
         self,
         messages: list[dict[str, Any]],
