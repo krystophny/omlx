@@ -2118,6 +2118,7 @@ class Scheduler:
         # value during active decode instead of touching MLX/Metal directly.
         self._last_mlx_active_memory_bytes: int = 0
         self._last_mlx_cache_memory_bytes: int = 0
+        self._last_mlx_peak_memory_bytes: int = 0
         self._last_mlx_active_memory_at: float = 0.0
         # Component ceilings — propagated alongside the hard limit so the
         # rejection-path error message can identify which constraint is
@@ -5218,6 +5219,7 @@ class Scheduler:
             cache = max(0, int(mx.get_cache_memory()))
             self._last_mlx_active_memory_bytes = active
             self._last_mlx_cache_memory_bytes = cache
+            self._last_mlx_peak_memory_bytes = max(0, int(mx.get_peak_memory()))
             self._last_mlx_active_memory_at = time.monotonic()
         hot_cache_cpu_bytes = getattr(self, "_hot_cache_cpu_bytes", None)
         if callable(hot_cache_cpu_bytes):

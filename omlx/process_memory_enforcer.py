@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import os
 import subprocess
 import time
 from contextlib import suppress
@@ -1969,6 +1970,40 @@ class ProcessMemoryEnforcer:
         # Walk each scheduler's store-cache gate ±1 toward its
         # pressure-driven target every poll (#1383).
         self._walk_store_cache_caps()
+
+    def get_memory_diagnostics(self) -> dict:
+        """Content-free accounting with cached executor samples; never call MLX here.
+
+        MLX's allocator is shared by all schedulers in this process. Samples
+        from different models must not be added. Their age identifies stale
+        observations while a scheduler is idle.
+        """
+        status = self.get_status()
+        active, total = self._cached_executor_mlx_memory_bytes()
+        now = time.monotonic()
+        samples = []
+        for model_id, entry in self._engine_pool._entries.items():
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is None:
+                continue
+            at = getattr(scheduler, "_last_mlx_active_memory_at", 0.0)
+            samples.append({
+                "model_id": model_id,
+                "active_bytes": getattr(scheduler, "_last_mlx_active_memory_bytes", 0),
+                "pool_bytes": getattr(scheduler, "_last_mlx_cache_memory_bytes", 0),
+                "peak_bytes": getattr(scheduler, "_last_mlx_peak_memory_bytes", None),
+                "age_seconds": max(0.0, now - at) if at > 0 else None,
+            })
+        status.update({
+            "pid": os.getpid(),
+            "raw_phys_bytes": get_phys_footprint(),
+            "graphics_bytes": get_graphics_footprint(),
+            "mlx_active_bytes": active,
+            "mlx_active_and_pool_bytes": total,
+            "unreleased_graphics_bytes": unreleased_graphics_bytes(total, fresh=False),
+            "allocator_samples": samples,
+        })
+        return status
 
     def get_status(self) -> dict:
         """Get enforcer status for monitoring endpoints.
