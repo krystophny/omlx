@@ -6632,7 +6632,7 @@ def _build_active_models_data() -> dict:
     enforcer_status = None
     if enforcer is not None:
         try:
-            enforcer_status = enforcer.get_status()
+            enforcer_status = enforcer.get_memory_diagnostics()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Memory enforcer status unavailable: %s", exc)
     models = []
@@ -6922,6 +6922,7 @@ def _build_active_models_data() -> dict:
         "models": models,
         "model_memory_used": memory_used,
         "model_memory_max": memory_max,
+        "memory_diagnostics": enforcer_status,
         "memory_pressure": {
             "enabled": bool(enforcer_status and enforcer_status.get("enabled")),
             "current_bytes": (
