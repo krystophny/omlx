@@ -1850,6 +1850,18 @@ def _audio_feature_cache_key_ranges(
     return ranges
 
 
+
+def vision_feature_ssd_dir(scheduler_config: Any) -> Optional[Path]:
+    """SSD directory for vision features, or None to keep them in memory.
+
+    Hot-cache-only mode keeps every cache in RAM; vision features are derived
+    from user images and must not reach disk there either.
+    """
+    if scheduler_config is None or getattr(scheduler_config, "hot_cache_only", False):
+        return None
+    ssd_dir = getattr(scheduler_config, "paged_ssd_cache_dir", None)
+    return Path(ssd_dir) / "vision_features" if ssd_dir else None
+
 class VLMBatchedEngine(BaseEngine):
     """
     VLM engine with continuous batching, tiered KV cache, and boundary snapshots.
@@ -2510,12 +2522,7 @@ class VLMBatchedEngine(BaseEngine):
         # Initialize vision feature cache
         vision_ssd_dir = None
         if not self.is_diffusion_model:
-            if self._scheduler_config and getattr(
-                self._scheduler_config, "paged_ssd_cache_dir", None
-            ):
-                vision_ssd_dir = (
-                    Path(self._scheduler_config.paged_ssd_cache_dir) / "vision_features"
-                )
+            vision_ssd_dir = vision_feature_ssd_dir(self._scheduler_config)
             self._vision_cache = VisionFeatureSSDCache(
                 cache_dir=vision_ssd_dir,
                 # Agent sessions resend 20-90 screenshots; bound by bytes.
