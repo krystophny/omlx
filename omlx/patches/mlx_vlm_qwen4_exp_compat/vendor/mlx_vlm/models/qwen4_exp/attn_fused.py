@@ -9,7 +9,10 @@ replace most of them with the same float operations in the same order:
 
 * ``prep_qk``: the q and k RMS norms (``mx.fast.rms_norm`` with the FP32
   ``1 + weight`` scale, its ``rms_single_row`` reduction lane for lane) and
-  mlx-vlm's fused MRoPE kernel, for every head and row in one launch.
+  mlx-vlm's fused MRoPE kernel, for every head and row in one launch. With a
+  YaRN attention scaling it follows mlx-vlm's eager MRoPE, which serves YaRN.
+  Its arithmetic does not depend on the GPU, so prefill rows use it on every
+  GPU (``prep_ready``).
 * ``dense_sdpa_gate``: MLX 0.32.2's vector SDPA plan of each row -- the
   one-pass kernel below 1024 keys, the two-pass kernel with 128 partitions
   from 1024 keys (Apple 'd' GPUs) -- then MLX's multiply by the gate's
@@ -21,9 +24,9 @@ replace most of them with the same float operations in the same order:
   row of a verify window takes the plan its own serial decode step would,
   in one launch pair.
 
-``ready`` runs each specialization once on tiny inputs first; a compile or
-launch failure turns the kernels off for the process and callers keep the
-MLX path.
+``prep_ready`` and ``ready`` run each specialization once on tiny inputs
+first; a compile or launch failure turns the kernels off for the process and
+callers keep the MLX path.
 """
 
 from __future__ import annotations
@@ -129,6 +132,19 @@ _PREP_SOURCE = r"""
         float pos = static_cast<float>(position_ids[t]);
 #endif
         float angle = pos * static_cast<float>(inv_freq[freq_idx]);
+        if (rope_scale[0] != 1.0f) {
+            // YaRN runs mlx-vlm's eager MRoPE instead: precise cos/sin times
+            // the attention scaling, rounded to T, then T arithmetic with
+            // each product rounded (MLX does not contract it into an fma).
+#pragma clang fp contract(off)
+            const T c = static_cast<T>(metal::precise::cos(angle) * rope_scale[0]);
+            const T s = static_cast<T>(metal::precise::sin(angle) * rope_scale[0]);
+            const T xv = normed[d];
+            const T xp = normed[pair_d];
+            x_out[d] = xv * c + (-xp) * s;
+            x_out[pair_d] = xp * c + xv * s;
+            continue;
+        }
         float c = metal::cos(angle);
         float s = metal::sin(angle);
         float xv = static_cast<float>(normed[d]);
@@ -419,6 +435,7 @@ def _kernel(name: str):
                 "position_ids",
                 "inv_freq",
                 "position_selector",
+                "rope_scale",
             ],
             output_names=["queries", "keys"],
             source=_PREP_SOURCE,
@@ -509,10 +526,12 @@ def prep_qk(
     heads: int,
     kv_heads: int,
     rotary_dim: int,
+    rope_scale: float = 1.0,
 ):
     """``(queries [1, heads, R, D], keys [1, kv_heads, R, D])``: the q/k norms
     and MRoPE of ``R`` projected rows -- ``q_proj`` [R, heads * 2 * D] holds
-    each head's query then gate, ``k_proj`` [R, kv_heads * D]; ``D`` = 256."""
+    each head's query then gate, ``k_proj`` [R, kv_heads * D]; ``D`` = 256.
+    ``rope_scale`` is the rotary's attention scaling (YaRN mscale)."""
     rows = q_proj.shape[0]
     head_dim = k_proj.shape[-1] // kv_heads
     dtype = q_proj.dtype
@@ -526,6 +545,7 @@ def prep_qk(
             position_ids,
             inv_freq,
             position_selector,
+            _scalar(rope_scale, mx.float32),
         ],
         template=[
             ("T", dtype),
@@ -607,46 +627,80 @@ def dense_sdpa_gate(
     )[0]
 
 
-def ready(dtype, heads: int, kv_heads: int, head_dim: int, rotary_dim: int, pos_ndim: int) -> bool:
-    """Whether the kernels serve this layout: the one-pass chains need the
-    query heads of a KV head in pairs, the transcribed plans 12+ of them and
-    head dim 256 (the RMS layout too). Each specialization runs once on tiny
-    inputs first; a compile or launch failure turns the kernels off."""
+def _tiny_prep(
+    dtype, heads: int, kv_heads: int, head_dim: int, rotary_dim: int, pos_ndim: int
+):
+    q_proj = mx.zeros((1, heads * 2 * head_dim), dtype=dtype)
+    k_proj = mx.ones((1, kv_heads * head_dim), dtype=dtype)
+    scale = mx.ones((head_dim,), dtype=mx.float32)
+    positions = mx.zeros((3, 1, 1) if pos_ndim == 3 else (1, 1), dtype=mx.int32)
+    half = rotary_dim // 2
+    return prep_qk(
+        q_proj,
+        k_proj,
+        scale,
+        scale,
+        1e-6,
+        positions,
+        mx.ones((half,), dtype=mx.float32),
+        mx.zeros((half,), dtype=mx.int32),
+        heads=heads,
+        kv_heads=kv_heads,
+        rotary_dim=rotary_dim,
+    )
+
+
+def prep_ready(
+    dtype, heads: int, kv_heads: int, head_dim: int, rotary_dim: int, pos_ndim: int
+) -> bool:
+    """Whether ``prep_qk`` serves this layout, on any GPU: head dim 256 (the
+    RMS layout) and an even rotary width within it. Each specialization runs
+    once on tiny inputs first; a compile or launch failure turns the kernels
+    off."""
     global _DISABLED
-    if _DISABLED or _gpu_class() != "d":
+    if _DISABLED:
         return False
-    gqa = heads // kv_heads if kv_heads else 0
     if (
         head_dim != 256
         or not kv_heads
-        or heads % kv_heads
-        or gqa < 6
-        or gqa % _ONE_PASS_HPT
         or rotary_dim % 2
         or not 0 < rotary_dim <= head_dim
     ):
+        return False
+    signature = ("prep", dtype, heads, kv_heads, head_dim, rotary_dim, pos_ndim)
+    if signature in _READY:
+        return True
+    try:
+        mx.eval(*_tiny_prep(dtype, heads, kv_heads, head_dim, rotary_dim, pos_ndim))
+    except Exception:
+        _DISABLED = True
+        logger.warning(
+            "Qwen4 fused attention kernels failed; using the MLX path", exc_info=True
+        )
+        return False
+    _READY.add(signature)
+    return True
+
+
+def ready(dtype, heads: int, kv_heads: int, head_dim: int, rotary_dim: int, pos_ndim: int) -> bool:
+    """Whether the decode kernels serve this layout: ``prep_ready``'s, and
+    the one-pass chains need the query heads of a KV head in pairs, the
+    transcribed plans 12+ of them on a 'd' GPU. Each specialization runs once
+    on tiny inputs first; a compile or launch failure turns the kernels off."""
+    global _DISABLED
+    if _gpu_class() != "d" or not prep_ready(
+        dtype, heads, kv_heads, head_dim, rotary_dim, pos_ndim
+    ):
+        return False
+    gqa = heads // kv_heads
+    if heads % kv_heads or gqa < 6 or gqa % _ONE_PASS_HPT:
         return False
     signature = (dtype, heads, kv_heads, head_dim, rotary_dim, pos_ndim)
     if signature in _READY:
         return True
     try:
-        q_proj = mx.zeros((1, heads * 2 * head_dim), dtype=dtype)
-        k_proj = mx.ones((1, kv_heads * head_dim), dtype=dtype)
-        scale = mx.ones((head_dim,), dtype=mx.float32)
-        positions = mx.zeros((3, 1, 1) if pos_ndim == 3 else (1, 1), dtype=mx.int32)
-        half = rotary_dim // 2
-        queries, keys = prep_qk(
-            q_proj,
-            k_proj,
-            scale,
-            scale,
-            1e-6,
-            positions,
-            mx.ones((half,), dtype=mx.float32),
-            mx.zeros((half,), dtype=mx.int32),
-            heads=heads,
-            kv_heads=kv_heads,
-            rotary_dim=rotary_dim,
+        queries, keys = _tiny_prep(
+            dtype, heads, kv_heads, head_dim, rotary_dim, pos_ndim
         )
         cache = mx.zeros((1, kv_heads, 4, head_dim), dtype=dtype)
         gate = mx.ones((1, heads * head_dim), dtype=dtype)

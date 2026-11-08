@@ -28,6 +28,7 @@
         'max_tool_result_tokens',
         'index_cache_freq',
         'turboquant_kv_enabled',
+        'turboquant_kv_scheme',
         'turboquant_kv_bits',
         'turboquant_skip_last',
         'qwen35_ane_prefill_enabled',
@@ -48,8 +49,8 @@
         'qwen35_ane_prefill_cpu_shared_resource',
         'moe_expert_offload_enabled',
         'moe_expert_offload_resident_fraction',
-        'qwen35_oq_a8_enabled',
-        'qwen35_oq_a8_min_tokens',
+        'a8_prefill_enabled',
+        'a8_prefill_min_tokens',
         'specprefill_enabled',
         'specprefill_draft_model',
         'specprefill_keep_pct',
@@ -58,16 +59,8 @@
         'dflash_draft_model',
         'dflash_draft_quant_enabled',
         'dflash_draft_quant_weight_bits',
-        'dflash_draft_quant_activation_bits',
         'dflash_draft_quant_group_size',
-        'dflash_max_ctx',
-        'dflash_in_memory_cache',
-        'dflash_in_memory_cache_max_entries',
-        'dflash_in_memory_cache_max_bytes',
-        'dflash_ssd_cache',
-        'dflash_ssd_cache_max_bytes',
         'dflash_draft_window_size',
-        'dflash_draft_sink_size',
         'dflash_block_size',
         'dflash_verify_mode',
         'mtp_enabled',
@@ -98,9 +91,14 @@
         'muse_glimmer_assistant',
     ]);
     const DASHBOARD_MAIN_TABS = new Set(['status', 'cluster', 'settings', 'models', 'logs', 'bench']);
-    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models']);
+    const DASHBOARD_SETTINGS_TABS = new Set(['global', 'integrations', 'models', 'theme']);
+    // settings.theme.contrast.<label> for each contrast-rule foreground.
+    const THEME_CONTRAST_LABELS = {
+        'text-primary': 'text', 'text-secondary': 'secondary', 'link-color': 'link', 'btn-primary-text': 'button',
+    };
     const DASHBOARD_MODELS_TABS = new Set(['manager', 'downloader', 'quantizer', 'uploader']);
     const DASHBOARD_BENCH_TABS = new Set(['throughput', 'accuracy', 'context']);
+    const DASHBOARD_DOWNLOADER_SOURCES = new Set(['hf', 'ms', 'recommended']);
     const THEME_STORAGE_KEY = 'omlx-chat-theme';
     const ENHANCED_READABILITY_KEY = 'omlx-enhanced-readability';
 
@@ -131,30 +129,6 @@
     };
     const ACC_PRESET_NAMES = ['quick', 'standard', 'full'];
 
-    // Chinese counts in ten-thousands: 万/亿/万亿 (zh) and 萬/億/兆 (zh-TW), the
-    // exact grouped figure below 10,000. Returns null for every other language.
-    function chineseCount(value) {
-        const lang = typeof document !== 'undefined' ? document.documentElement?.lang : '';
-        if (lang !== 'zh' && lang !== 'zh-TW') return null;
-        const number = Number(value);
-        if (!Number.isFinite(number)) return null;
-        const units = lang === 'zh-TW' ? ['萬', '億', '兆'] : ['万', '亿', '万亿'];
-        const scales = [1e4, 1e8, 1e12];
-        const magnitude = Math.abs(number);
-        let step = scales.length - 1;
-        while (step >= 0 && magnitude < scales[step]) step -= 1;
-        if (step < 0) return Math.round(number).toLocaleString(lang);
-        let mantissa = (magnitude / scales[step]).toFixed(1);
-        // 10,000万 is 1亿: the unit follows the printed mantissa.
-        if (Number(mantissa) >= 10000 && step < scales.length - 1) {
-            step += 1;
-            mantissa = (magnitude / scales[step]).toFixed(1);
-        }
-        const [whole, fraction] = mantissa.replace(/\.0$/, '').split('.');
-        const text = Number(whole).toLocaleString(lang) + (fraction ? '.' + fraction : '');
-        return (number < 0 ? '-' : '') + text + units[step];
-    }
-
     function dashboard() {
         // GridStack instance and helpers stay outside the reactive Alpine state.
         let dashGrid = null;
@@ -167,12 +141,28 @@
             activeTheme: 'light', // Will be updated by applyTheme
             systemThemeListener: null,
             enhancedReadability: localStorage.getItem(ENHANCED_READABILITY_KEY) === 'on',
+            // Script tests load this file without custom_theme.js, hence the fallbacks.
+            customThemeGroups: window.OmlxCustomTheme?.GROUPS ?? [],
+            customThemeStored: window.OmlxCustomTheme?.sanitize(window._customTheme) ?? { light: {}, dark: {} },
+            customThemeDefaults: { light: {}, dark: {} },
+            customThemeDraft: { light: {}, dark: {} },
+            customThemeSaving: false,
+            customThemeSaved: false,
+            customThemeError: '',
+            customThemeJson: '',
+            customThemeJsonError: '',
+            _customThemeSavedTimer: null,
+            _customThemeReady: false,
 
             // Global settings section rail
             settingsActiveSection: 'settings-language',
             settingsCopiedAnchor: null,
             _settingsSyncPausedUntil: 0,
             _settingsScrollWatched: false,
+            // Model settings modal section rail
+            modelSettingsActiveSection: 'ms-basic',
+            _modelSettingsSyncPausedUntil: 0,
+            _modelSettingsScrollFrame: 0,
 
             // Mobile menu
             mobileMenuOpen: false,
@@ -187,18 +177,18 @@
             // Global settings
             globalSettings: {
                 base_path: '',
-                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, qwen4_gdn_decode_wide_proj: false, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
+                server: { host: '127.0.0.1', port: 8000, log_level: 'info', sse_keepalive_mode: 'chunk', burst_decode_mode: 'balanced', preserve_mid_system_cache: true, distributed_inference_enabled: false, distributed_inference_active: false, max_audio_upload_size: '100MB' },
                 model: { model_dirs: [''], model_fallback: false, hide_helper_models: false },
                 memory: { prefill_memory_guard: true, memory_guard_tier: 'balanced', memory_guard_custom_ceiling_gb: 0 },
                 scheduler: { max_concurrent_requests: 8, embedding_batch_size: 32, chunked_prefill: false, prefill_priority: 'context', decode_fairness: true },
-                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
+                cache: { enabled: true, ssd_cache_dir: '', ssd_cache_unavailable: false, ssd_cache_max_size: 'auto', hot_cache_max_size: '0', hot_cache_write_through: false, ane_compile_cache: false, initial_cache_blocks: 256, hot_cache_only: false, gdn_snapshot_storage: 'auto', gdn_ssd_split_enabled: true, gdn_ssd_pending_max_size: '512MB', gdn_sidecar_precision: 'fp32' },
                 sampling: { max_context_window: 32768, max_context_window_policy: null, max_tokens: 32768, temperature: 1.0, top_p: 0.95, top_k: 0, repetition_penalty: 1.0 },
                 mcp: { config_path: '', expose_tools: true },
                 usage: { usage_history: true },
                 huggingface: { endpoint: '', hf_cache_enabled: true, hf_cache_path: '' },
                 network: { http_proxy: '', https_proxy: '', no_proxy: '', ca_bundle: '' },
-                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, sub_keys: [] },
-                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null },
+                auth: { api_key_set: false, api_key: '', skip_api_key_verification: false, allow_unauthenticated_inference: false, sub_keys: [] },
+                claude_code: { mode: 'cloud', opus_model: null, sonnet_model: null, haiku_model: null, desktop_enabled: false },
                 integrations: {
                     copilot_model: null,
                     codex_model: null,
@@ -206,6 +196,7 @@
                     openclaw_model: null,
                     hermes_model: null,
                     pi_model: null,
+                    vibe_model: null,
                     dsh_model: null,
                     openclaw_tools_profile: 'full',
                     markitdown_enabled: true,
@@ -221,6 +212,14 @@
                     web_search_content_mode: 'snippet',
                     web_search_content_truncate: true,
                     web_search_content_max_chars: 20000,
+                    splash_path: null,
+                    splash_kv_format: 'int8',
+                    splash_max_memory_gb: null,
+                    splash_ssd_cache_gb: null,
+                    splash_ane_prefill: true,
+                },
+                external_engines: {
+                    splash: { available: false, path: null, auto_detected: null, version: null, label: null, reason: '', install_hint: '', models: [] },
                 },
                 ui: { language: 'en', dashboard_layout: null },
                 idle_timeout: { idle_timeout_seconds: null },
@@ -229,6 +228,11 @@
 
             // Web search "Test search" button state
             webSearchTest: { running: false, ok: null, message: '' },
+            // Splash launcher path row: manual entry when not detected or changed
+            splashPath: { editing: false, draft: '', error: '', saving: false },
+            splashOptionsError: '',
+            // Claude Desktop gateway profile state (macOS auto-config)
+            claudeDesktop: { configured: false, working: false, message: '' },
             // Engines selectable for the DDGS Custom provider (ddgs 9.14.1 text registry)
             ddgsBackendList: ['brave', 'duckduckgo', 'grokipedia', 'mojeek', 'wikipedia', 'yahoo', 'yandex'],
 
@@ -275,6 +279,8 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            moeOffloadFit: null,
+            moeOffloadFitUrl: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -309,8 +315,11 @@
                 qwen35_ane_prefill_cpu_shared_resource: true,
                 moe_expert_offload_enabled: false,
                 moe_expert_offload_resident_fraction: 0.25,
-                qwen35_oq_a8_enabled: false,
-                qwen35_oq_a8_min_tokens: 128,
+                a8_prefill_enabled: false,
+                a8_prefill_min_tokens: 128,
+                external_engine: '',
+                external_engines: [],
+                model_format: null,
                 trust_remote_code: false,
                 embedding_audio_enabled: false,
                 embedding_audio_max_seconds: null,
@@ -340,6 +349,12 @@
                 allowCpuSharedResource: true,
             },
             _aneTuningPollTimer: null,
+            // Prefill Accelerator: paired Macs that can help the open model,
+            // and its helper status (polled while the modal is open).
+            prefillHelper: { modelId: null, candidates: [], version: '', loading: false, status: null, busy: false, original: null, applied: false },
+            _prefillHelperPollTimer: null,
+            // Set while this Mac runs another Mac's prefill helper.
+            prefillLending: null,
 
             // Profile / template / preset state
             profiles: [],                // per-model profiles for selectedModel
@@ -391,6 +406,7 @@
                 runtime_cache: {
                     base_path: '',
                     ssd_cache_dir: '',
+                    ssd_cache_unavailable: false,
                     response_state_dir: '',
                     models: [],
                     total_num_files: 0,
@@ -427,6 +443,7 @@
             },
 
             statsScope: 'session',
+            statsNumberScale: window.omlxCount?.scale?.() || 'compact',
             // Dashboard block layout (see dashboard_layout.js)
             dashLayout: null,
             dashDraft: null,
@@ -494,13 +511,19 @@
             hfTokenInvalid: false,
             _hfRefreshTimer: null,
             hfDeleteConfirm: null,
+            // Lowercased repo ID -> {files, size} from the last update check.
+            hfUpdates: {},
+            hfUpdatesChecking: false,
+            hfUpdatesStatus: '',
 
             // Recommended models state
             hfRecommended: { trending: [], popular: [] },
             hfRecommendedLoaded: false,
             hfRecommendedLoading: false,
             hfRecommendedTab: 'trending',
-            hfMlxOnly: true,
+            // Downloader repo filter: 'mlx', 'gguf' or 'all'.
+            hfModelFormat: ['mlx', 'gguf', 'all'].includes(localStorage.getItem('hfModelFormat'))
+                ? localStorage.getItem('hfModelFormat') : 'mlx',
 
             // Pagination state
             hfPage: { trending: 1, popular: 1, search: 1 },
@@ -535,6 +558,23 @@
             // Model detail modal
             hfModelDetail: null,
             hfModelDetailLoading: false,
+            hfDetailTab: 'card',
+            // File name -> picked for download, for the detail modal's Files tab.
+            hfSelectedFiles: {},
+
+            // Recommended (hardware-aware oQ picks) state
+            recommendations: null,
+            recommendationsLoading: false,
+            recommendationsError: '',
+            recommendationsApplying: false,
+            // null follows the default: open unless the Mac has 16 GB or less.
+            recommendationsUnlockOpen: null,
+
+            // First-run banner. Only shown when the first model list was empty;
+            // dismissing hides it until the next page load.
+            onboardingStartedEmpty: false,
+            onboardingDismissed: false,
+            onboardingReadyDismissed: false,
 
             // ModelScope Downloader state
             downloaderSource: 'hf',
@@ -590,6 +630,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqPreserveNgram: false,
             oqMtpAssistantPath: '',
             oqEnhanced: false,
             oqeReuseImatrixCache: true,
@@ -769,7 +810,16 @@
                     this.checkForUpdate()
                 ]);
 
+                this.fetchClaudeDesktopStatus();
+
                 this.startUpdateCheckTimer();
+                this.pollPrefillLending();
+
+                this.onboardingStartedEmpty = !this.hasUserModels;
+                if (this.onboardingStartedEmpty
+                    && !new URLSearchParams(window.location.search).has('source')) {
+                    this.downloaderSource = 'recommended';
+                }
 
                 await this.handleMainTabChange(this.mainTab);
                 this.settingsScrollToHash();
@@ -796,7 +846,8 @@
                     }
                 });
 
-                this.$watch('hfMlxOnly', () => {
+                this.$watch('hfModelFormat', (value) => {
+                    localStorage.setItem('hfModelFormat', value);
                     this.hfRecommended = { trending: [], popular: [] };
                     this.hfRecommendedLoaded = false;
                     this.hfSearchResults = [];
@@ -856,6 +907,9 @@
                     if (this.modelsTab === 'downloader' && !this.hfRecommendedLoaded) {
                         loads.push(this.loadRecommendedModels());
                     }
+                    if (this.modelsTab === 'downloader' && this.downloaderSource === 'recommended') {
+                        loads.push(this.loadRecommendations());
+                    }
                     if (this.modelsTab === 'quantizer') {
                         loads.push(this.loadOQModels());
                     }
@@ -884,6 +938,11 @@
                     await this.loadAccState();
                     await this.loadCtxBenchState();
                 }
+                // The first-run banner shows download progress on the dashboard.
+                if (value === 'status' && this.onboardingStartedEmpty) {
+                    await this.loadHFTasks();
+                    if (this.onboardingTask) this.startHFRefresh();
+                }
             },
 
             applyTabStateFromUrl() {
@@ -896,8 +955,11 @@
 
                 this.mainTab = DASHBOARD_MAIN_TABS.has(mainTab) ? mainTab : 'status';
                 this.activeTab = DASHBOARD_SETTINGS_TABS.has(settingsTab) ? settingsTab : 'global';
+                if (this.activeTab === 'theme') this.initCustomThemeEditor();
                 this.modelsTab = DASHBOARD_MODELS_TABS.has(modelsTab) ? modelsTab : 'manager';
                 this.benchTab = DASHBOARD_BENCH_TABS.has(benchTab) ? benchTab : 'throughput';
+                const source = params.get('source');
+                if (DASHBOARD_DOWNLOADER_SOURCES.has(source)) this.downloaderSource = source;
 
                 // A section anchor opens global settings unless the URL names another tab.
                 const section = window.location.hash.slice(1);
@@ -922,6 +984,12 @@
                     url.searchParams.set('modelsTab', this.modelsTab);
                 } else {
                     url.searchParams.delete('modelsTab');
+                }
+
+                if (this.mainTab === 'models' && this.modelsTab === 'downloader') {
+                    url.searchParams.set('source', this.downloaderSource);
+                } else {
+                    url.searchParams.delete('source');
                 }
 
                 if (this.mainTab === 'bench') {
@@ -983,6 +1051,7 @@
                 if (!DASHBOARD_SETTINGS_TABS.has(tab)) return;
                 this.activeTab = tab;
                 this.mainTab = 'settings';
+                if (tab === 'theme') this.initCustomThemeEditor();
                 this.syncTabStateToUrl();
             },
 
@@ -1018,20 +1087,22 @@
                 const sections = Array.from(document.querySelectorAll('#panel-settings .settings-section'))
                     .filter((el) => el.getClientRects().length);
                 if (!sections.length) return;
-                // At the bottom of the page the last sections cannot reach the line.
                 const doc = document.documentElement;
-                if (window.scrollY > 0 && window.scrollY + window.innerHeight >= doc.scrollHeight - 2) {
-                    this.settingsActiveSection = sections[sections.length - 1].id;
-                    return;
-                }
+                const atBottom = window.scrollY > 0 && window.scrollY + window.innerHeight >= doc.scrollHeight - 2;
+                this.settingsActiveSection = this._currentSectionId(
+                    sections, atBottom, (el) => parseFloat(getComputedStyle(el).scrollMarginTop) || 0);
+            },
+
+            _currentSectionId(sections, atBottom, lineOf) {
+                // At the bottom the last sections cannot reach the line.
+                if (atBottom) return sections[sections.length - 1].id;
                 // A section is current once its top passes the line it scrolls to.
                 let current = sections[0].id;
                 for (const el of sections) {
-                    const line = parseFloat(getComputedStyle(el).scrollMarginTop) || 0;
-                    if (el.getBoundingClientRect().top > line + 1) break;
+                    if (el.getBoundingClientRect().top > lineOf(el) + 1) break;
                     current = el.id;
                 }
-                this.settingsActiveSection = current;
+                return current;
             },
 
             settingsWatchScroll() {
@@ -1047,6 +1118,40 @@
                 };
                 window.addEventListener('scroll', onScroll, { passive: true });
                 window.addEventListener('resize', onScroll);
+            },
+
+            modelSettingsGoToSection(id) {
+                this.modelSettingsActiveSection = id;
+                // Smooth scrolling passes other sections; keep the clicked one marked.
+                this._modelSettingsSyncPausedUntil = Date.now() + 1000;
+                this.$nextTick(() => {
+                    const body = this.$refs.modelSettingsBody;
+                    const target = document.getElementById(id);
+                    if (!body || !target || !target.getClientRects().length) return;
+                    // scrollIntoView would also scroll the page behind the dialog.
+                    const top = body.scrollTop + target.getBoundingClientRect().top
+                        - body.getBoundingClientRect().top - parseFloat(getComputedStyle(body).paddingTop);
+                    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+                    body.scrollTo({ top, behavior: reduce ? 'auto' : 'smooth' });
+                });
+            },
+
+            modelSettingsSyncActiveSection(body) {
+                if (Date.now() < this._modelSettingsSyncPausedUntil) return;
+                const sections = Array.from(body.querySelectorAll('.model-settings-section'))
+                    .filter((el) => el.getClientRects().length);
+                if (!sections.length) return;
+                const atBottom = body.scrollTop > 0 && body.scrollTop + body.clientHeight >= body.scrollHeight - 2;
+                const line = body.getBoundingClientRect().top + parseFloat(getComputedStyle(body).paddingTop);
+                this.modelSettingsActiveSection = this._currentSectionId(sections, atBottom, () => line);
+            },
+
+            modelSettingsOnScroll(body) {
+                if (this._modelSettingsScrollFrame) return;
+                this._modelSettingsScrollFrame = requestAnimationFrame(() => {
+                    this._modelSettingsScrollFrame = 0;
+                    this.modelSettingsSyncActiveSection(body);
+                });
             },
 
             settingsCopyAnchor(id) {
@@ -1069,6 +1174,22 @@
                     if (!this.uploadOqModelsLoaded) this.loadUploadOqModels();
                     this.loadUploadTasks();
                 }
+                if (tab === 'downloader' && this.downloaderSource === 'recommended') {
+                    this.loadRecommendations();
+                }
+            },
+
+            setDownloaderSource(source) {
+                if (!DASHBOARD_DOWNLOADER_SOURCES.has(source)) return;
+                this.downloaderSource = source;
+                this.syncTabStateToUrl();
+                if (source === 'ms') this.initMsDownloader();
+                if (source === 'recommended') this.loadRecommendations();
+            },
+
+            openRecommendations() {
+                this.downloaderSource = 'recommended';
+                this.setModelsTab('downloader');
             },
 
            async checkForUpdate() {
@@ -1187,6 +1308,7 @@
                             auth: { ...this.globalSettings.auth, ...data.auth },
                             claude_code: { ...this.globalSettings.claude_code, ...data.claude_code },
                             integrations: { ...this.globalSettings.integrations, ...data.integrations },
+                            external_engines: { ...this.globalSettings.external_engines, ...data.external_engines },
                             idle_timeout: { ...this.globalSettings.idle_timeout, ...data.idle_timeout },
                             system: { ...this.globalSettings.system, ...data.system },
                         };
@@ -1239,6 +1361,15 @@
                 }
             },
 
+            toggleUnauthenticatedInference() {
+                const auth = this.globalSettings.auth;
+                if (!auth.allow_unauthenticated_inference
+                    && !window.confirm(window.t('settings.auth.keyless_inference_confirm'))) {
+                    return;
+                }
+                auth.allow_unauthenticated_inference = !auth.allow_unauthenticated_inference;
+            },
+
             isLoopbackBindHost(value) {
                 const hosts = String(value || '')
                     .split(',')
@@ -1269,7 +1400,7 @@
             },
 
             async saveGlobalSettings() {
-                if (this.resettingGlobalSettings) return;
+                if (this.saving || this.resettingGlobalSettings) return;
                 this.saving = true;
                 this.saveSuccess = false;
                 this.saveError = '';
@@ -1331,7 +1462,6 @@
                             sse_keepalive_mode: this.globalSettings.server.sse_keepalive_mode,
                             burst_decode_mode: this.globalSettings.server.burst_decode_mode,
                             preserve_mid_system_cache: this.globalSettings.server.preserve_mid_system_cache,
-                            qwen4_gdn_decode_wide_proj: this.globalSettings.server.qwen4_gdn_decode_wide_proj,
                             distributed_inference_enabled: this.globalSettings.server.distributed_inference_enabled,
                             max_audio_upload_size: this.globalSettings.server.max_audio_upload_size,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
@@ -1375,6 +1505,7 @@
                             network_ca_bundle: this.globalSettings.network.ca_bundle,
                             ...(this.globalSettings.auth.api_key ? { api_key: this.globalSettings.auth.api_key } : {}),
                             skip_api_key_verification: this.globalSettings.auth.skip_api_key_verification,
+                            allow_unauthenticated_inference: this.globalSettings.auth.allow_unauthenticated_inference,
                             idle_timeout_seconds: this.globalSettings.idle_timeout?.idle_timeout_seconds ?? null,
                         }),
                     });
@@ -1605,6 +1736,8 @@
                     if (k === 'enable_thinking' && this.selectedModel?.thinking_forced) continue;
                     if (k === 'chat_template_kwargs' || k === 'forced_ct_kwargs') continue;  // handle below
                     if (isDiffusion && this.isDiffusionUnsupportedProfileField(k)) continue;
+                    // A hidden A8 toggle stays unset (on) rather than saved.
+                    if (k.startsWith('a8_prefill_') && !this.showsA8Prefill(this.selectedModel)) continue;
                     if (k === 'thinking_budget_enabled') {
                         if (ms.enableThinkingBudget) out.thinking_budget_enabled = true;
                         continue;
@@ -1622,6 +1755,12 @@
                     if (k === 'max_tool_result_tokens') {
                         if (ms.enableToolResultLimit && ms.max_tool_result_tokens) {
                             out.max_tool_result_tokens = Number(ms.max_tool_result_tokens);
+                        }
+                        continue;
+                    }
+                    if (k === 'gpu_power_limit_w') {
+                        if (ms.enableGpuPowerLimit && ms.gpu_power_limit_w) {
+                            out.gpu_power_limit_w = Number(ms.gpu_power_limit_w);
                         }
                         continue;
                     }
@@ -2038,14 +2177,26 @@
                     thinking_default: model?.thinking_default ?? null,
                     qwen4_ple_ssd_offload: model?.qwen4_ple_ssd_offload_forced === true
                         || s.qwen4_ple_ssd_offload === true,
+                    qwen4_ple_ssd_offload_requested:
+                        s.qwen4_ple_ssd_offload === true,
                     qwen4_ple_ssd_offload_supported:
                         model?.qwen4_ple_ssd_offload_supported === true,
                     qwen4_ple_ssd_offload_forced:
                         model?.qwen4_ple_ssd_offload_forced === true,
+                    prefill_helper_supported: model?.prefill_helper_supported === true,
+                    prefill_helper_node_id: s.prefill_helper_node_id || '',
+                    prefill_helper_layers: s.prefill_helper_layers ? String(s.prefill_helper_layers) : '',
+                    // Unset means on; only a saved false is off.
                     deepseek_v41_ced_prefill_enabled:
-                        s.deepseek_v41_ced_prefill_enabled === true,
+                        s.deepseek_v41_ced_prefill_enabled !== false,
                     deepseek_v41_ced_prefill_supported:
                         String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'deepseek_v41',
+                    qwen4_gdn_decode_wide_proj:
+                        s.qwen4_gdn_decode_wide_proj === true,
+                    activation_fp16_enabled: s.activation_fp16_enabled === true,
+                    activation_fp16_supported: model?.activation_fp16_supported === true,
+                    qwen4_gdn_decode_wide_proj_supported:
+                        String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_') === 'qwen4_exp',
                     deepseek_v41_engram_ssd_offload: model?.deepseek_v41_engram_ssd_offload_forced === true
                         || s.deepseek_v41_engram_ssd_offload === true,
                     deepseek_v41_engram_ssd_offload_requested:
@@ -2056,6 +2207,9 @@
                         model?.deepseek_v41_engram_ssd_offload_forced === true,
                     enableThinkingBudget: !!(s.thinking_budget_tokens),
                     thinking_budget_tokens: s.thinking_budget_tokens || null,
+                    enableGpuPowerLimit: !!(s.gpu_power_limit_w),
+                    gpu_power_limit_w: s.gpu_power_limit_w || null,
+                    gpu_power_limit_supported: model?.gpu_power_limit_supported === true,
                     guided_grammar_enabled: s.guided_grammar_enabled || false,
                     guided_grammar: s.guided_grammar || '',
                     enableToolResultLimit: !!(s.max_tool_result_tokens),
@@ -2064,15 +2218,20 @@
                     ttl_seconds: s.ttl_seconds ?? null,
                     enableIndexCache: !!(s.index_cache_freq),
                     index_cache_freq: s.index_cache_freq || null,
-                    turboquant_kv_enabled: s.turboquant_kv_enabled || false,
-                    turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    turboquant_kv_enabled: !isDiffusion && !model?.is_paroquant
+                        && (s.turboquant_kv_enabled || false),
+                    turboquant_kv_scheme: isDiffusion || model?.is_paroquant
+                        ? 'turboquant' : (s.turboquant_kv_scheme || 'turboquant'),
+                    turboquant_kv_bits: isDiffusion || model?.is_paroquant
+                        ? 4 : (s.turboquant_kv_bits || 4),
                     moe_expert_offload_enabled: !isDiffusion && model?.moe_expert_offload_supported === true && !!s.moe_expert_offload_enabled,
                     moe_expert_offload_resident_fraction: s.moe_expert_offload_resident_fraction ?? 0.25,
                     moe_expert_offload_resident_percent: Number(((s.moe_expert_offload_resident_fraction ?? 0.25) * 100).toPrecision(15)),
                     moe_expert_offload_resident_touched: false,
                     moe_offload_allows_mtp: model?.moe_offload_allows_mtp === true,
-                    qwen35_oq_a8_enabled: s.qwen35_oq_a8_enabled || false,
-                    qwen35_oq_a8_min_tokens: s.qwen35_oq_a8_min_tokens ?? 128,
+                    // Unset means on unless ANE prefill takes the same projections.
+                    a8_prefill_enabled: s.a8_prefill_enabled ?? !s.qwen35_ane_prefill_enabled,
+                    a8_prefill_min_tokens: s.a8_prefill_min_tokens ?? 128,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -2097,25 +2256,12 @@
                     dflash_draft_model: s.dflash_draft_model || '',
                     dflash_draft_quant_enabled: s.dflash_draft_quant_enabled || false,
                     dflash_draft_quant_weight_bits: s.dflash_draft_quant_weight_bits || 4,
-                    dflash_draft_quant_activation_bits: s.dflash_draft_quant_activation_bits || 16,
                     dflash_draft_quant_group_size: s.dflash_draft_quant_group_size || 64,
-                    dflash_max_ctx: s.dflash_max_ctx ?? null,
-                    dflash_in_memory_cache: s.dflash_in_memory_cache !== false,
-                    dflash_in_memory_cache_max_entries: s.dflash_in_memory_cache_max_entries || 4,
-                    dflash_in_memory_cache_max_gib: s.dflash_in_memory_cache_max_bytes
-                        ? Math.round(s.dflash_in_memory_cache_max_bytes / (1024 ** 3))
-                        : 8,
-                    dflash_ssd_cache: s.dflash_ssd_cache || false,
-                    dflash_ssd_cache_max_gib: s.dflash_ssd_cache_max_bytes
-                        ? Math.round(s.dflash_ssd_cache_max_bytes / (1024 ** 3))
-                        : 20,
                     dflash_draft_window_size: s.dflash_draft_window_size ?? null,
-                    dflash_draft_sink_size: s.dflash_draft_sink_size ?? 0,
                     dflash_block_size: s.dflash_block_size ?? null,
                     dflash_verify_mode: s.dflash_verify_mode || 'adaptive',
                     dflash_compatible: model?.dflash_compatible !== false,
                     dflash_compatibility_reason: model?.dflash_compatibility_reason || '',
-                    dflash_ssd_cache_available: !!model?.dflash_ssd_cache_available,
                     mtp_enabled: s.mtp_enabled || false,
                     mtp_adaptive_max_depth: [3, 4, 5, 6].includes(s.mtp_adaptive_max_depth)
                         ? String(s.mtp_adaptive_max_depth) : '3',
@@ -2129,6 +2275,9 @@
                     vlm_mtp_draft_block_size: s.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     is_diffusion_model: isDiffusion,
+                    external_engine: s.external_engine || '',
+                    external_engines: model?.external_engines || [],
+                    model_format: model?.model_format || null,
                     trust_remote_code: s.trust_remote_code || false,
                     embedding_audio_enabled: s.embedding_audio_enabled || false,
                     embedding_audio_max_seconds: s.embedding_audio_max_seconds ?? null,
@@ -2157,6 +2306,41 @@
                         ),
                     );
                 }
+                this.onMoeExpertOffloadResidentPercent();
+            },
+
+            loadMoeOffloadFit() {
+                // Sized from the unsaved edits that change the estimate; refetch only when they change.
+                const model = this.selectedModel;
+                if (model?.moe_expert_offload_supported !== true) return;
+                const payload = this.buildModelSettingsPayload(this.modelSettings);
+                const params = new URLSearchParams();
+                for (const key of ['mtp_enabled', 'qwen4_ple_ssd_offload', 'deepseek_v41_engram_ssd_offload']) {
+                    params.set(key, String(!!payload[key]));
+                }
+                const url = `/admin/api/models/${encodeURIComponent(model.id)}/moe-offload-fit?${params}`;
+                if (url === this.moeOffloadFitUrl) return;
+                this.moeOffloadFitUrl = url;
+                this.moeOffloadFit = null;
+                return fetch(url).then(async resp => {
+                    if (!resp.ok) return;
+                    const fit = await resp.json();
+                    if (this.moeOffloadFitUrl === url) this.moeOffloadFit = fit;
+                }).catch(() => { /* network error */ });
+            },
+
+            moeOffloadFitText() {
+                const fit = this.moeOffloadFit;
+                const key = fit?.status === 'fit' ? 'moe_expert_offload_fit' : 'moe_expert_offload_no_fit';
+                return window.t(`modal.model_settings.${key}`)
+                    .replace('{percent}', fit?.max_percent)
+                    .replace('{size}', this.formatByteCount(fit?.bytes))
+                    .replace('{reserve}', this.formatByteCount(fit?.reserve_bytes));
+            },
+
+            applyMoeOffloadFit() {
+                if (this.moeOffloadFit?.status !== 'fit') return;
+                this.modelSettings.moe_expert_offload_resident_percent = this.moeOffloadFit.max_percent;
                 this.onMoeExpertOffloadResidentPercent();
             },
 
@@ -2190,6 +2374,8 @@
                 ms.enable_thinking = null;
                 ms.enableThinkingBudget = false;
                 ms.thinking_budget_tokens = null;
+                ms.enableGpuPowerLimit = false;
+                ms.gpu_power_limit_w = null;
                 ms.enableToolResultLimit = false;
                 ms.max_tool_result_tokens = null;
                 ms.ctKwargEntries = [];
@@ -2213,6 +2399,10 @@
                     } else if (k === 'max_tool_result_tokens') {
                         ms.enableToolResultLimit = s[k] != null;
                         ms.max_tool_result_tokens = s[k] ?? null;
+                    } else if (k === 'gpu_power_limit_w') {
+                        // Profiles may store 0 for "off".
+                        ms.enableGpuPowerLimit = s[k] > 0;
+                        ms.gpu_power_limit_w = s[k] > 0 ? s[k] : null;
                     } else if (k === 'guided_grammar_enabled') {
                         ms.guided_grammar_enabled = !!s[k];
                     } else if (k === 'guided_grammar') {
@@ -2860,6 +3050,8 @@
                     || this.selectedModel?.id !== model.id
                     || JSON.stringify(this.modelSettings) !== baseline)) return;
                 this.selectedModel = model;
+                // A fresh open re-sizes; a focus refresh keeps the current hint.
+                if (!preservingEdits) this.moeOffloadFitUrl = null;
                 this.modelSettings = this.buildModelSettingsState(
                     model,
                     model.settings || {},
@@ -2871,6 +3063,275 @@
                 }
                 this._modelSettingsBaseline = JSON.stringify(this.modelSettings);
                 this.showModelSettingsModal = true;
+                if (!preservingEdits) this.openPrefillHelper(model);
+                // Sync on the next frame: sections have no layout until the dialog opens.
+                this.$nextTick(() => {
+                    if (this.$refs.modelSettingsBody) this.modelSettingsOnScroll(this.$refs.modelSettingsBody);
+                });
+            },
+
+            async pollPrefillLending() {
+                if (this.globalSettings.server.distributed_inference_active && !document.hidden) {
+                    try {
+                        const resp = await fetch('/admin/api/prefill-helper/lending');
+                        if (resp.ok) {
+                            const data = await resp.json();
+                            this.prefillLending = data.active ? data : null;
+                        }
+                    } catch (_) { /* network error */ }
+                } else if (!this.globalSettings.server.distributed_inference_active) {
+                    this.prefillLending = null;
+                }
+                setTimeout(() => this.pollPrefillLending(), 5000);
+            },
+
+            async stopPrefillLending() {
+                try {
+                    await fetch('/admin/api/prefill-helper/lending/stop', { method: 'POST' });
+                } catch (_) { /* network error */ }
+                this.prefillLending = null;
+            },
+
+            prefillLendingText() {
+                const lending = this.prefillLending;
+                if (!lending) return '';
+                return window.t('dashboard.prefill_lending')
+                    .replaceAll('{host}', lending.host || '?')
+                    .replace('{n}', lending.layers ?? '')
+                    .replace('{model}', String(lending.model || '').split('/').pop());
+            },
+
+            openPrefillHelper(model) {
+                if (this._prefillHelperPollTimer) {
+                    clearTimeout(this._prefillHelperPollTimer);
+                    this._prefillHelperPollTimer = null;
+                }
+                this.prefillHelper = {
+                    modelId: model.id,
+                    candidates: [],
+                    version: '',
+                    loading: false,
+                    status: model.prefill_helper || null,
+                    busy: false,
+                    original: {
+                        prefill_helper_node_id: model.settings?.prefill_helper_node_id || null,
+                        prefill_helper_layers: model.settings?.prefill_helper_layers ?? null,
+                    },
+                    applied: false,
+                    checked: false,
+                };
+                if (!model.prefill_helper_supported
+                    || !this.globalSettings.server.distributed_inference_active) return;
+                this.loadPrefillHelperCandidates();
+                this.pollPrefillHelper();
+            },
+
+            async loadPrefillHelperCandidates() {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.loading = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/candidates?model_id=' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        const data = await resp.json();
+                        this.prefillHelper.candidates = data.devices || [];
+                        this.prefillHelper.version = data.version || '';
+                    }
+                } catch (_) { /* network error */ }
+                if (this.prefillHelper.modelId === modelId) this.prefillHelper.loading = false;
+            },
+
+            async pollPrefillHelper() {
+                const modelId = this.prefillHelper.modelId;
+                if (!this.showModelSettingsModal || this.selectedModel?.id !== modelId) {
+                    this._prefillHelperPollTimer = null;
+                    return;
+                }
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId)
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                        // A saved helper of an unloaded model: see whether its
+                        // files are already there (nothing is copied).
+                        if (this.prefillHelper.status.state === 'unloaded'
+                            && this.selectedModel?.settings?.prefill_helper_node_id
+                            && !this.prefillHelper.checked) {
+                            this.prefillHelper.checked = true;
+                            this.prefillHelperAction('check');
+                        }
+                    }
+                } catch (_) { /* network error */ }
+                this._prefillHelperPollTimer = setTimeout(() => this.pollPrefillHelper(), 2000);
+            },
+
+            async prefillHelperAction(action) {
+                const modelId = this.prefillHelper.modelId;
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(
+                        '/admin/api/prefill-helper/models/' + encodeURIComponent(modelId) + '/' + action,
+                        { method: 'POST' }
+                    );
+                    if (resp.ok && this.prefillHelper.modelId === modelId) {
+                        this.prefillHelper.status = await resp.json();
+                    }
+                } catch (_) { /* network error */ }
+                this.prefillHelper.busy = false;
+            },
+
+            prefillHelperCandidate(nodeId) {
+                return this.prefillHelper.candidates.find((d) => d.node_id === nodeId) || null;
+            },
+
+            prefillHelperUsable(device) {
+                return device.online && device.version_ok && device.layers_fit > 0;
+            },
+
+            prefillHelperOption(device) {
+                const parts = [device.name];
+                if (device.chip) parts.push(device.chip + (device.ram_gb ? ` ${device.ram_gb} GB` : ''));
+                if (!device.online) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_offline'));
+                } else if (!device.version_ok) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_update')
+                        .replace('{version}', this.prefillHelper.version || ''));
+                } else if (device.layers_fit > 0) {
+                    parts.push(window.t('modal.model_settings.prefill_helper_fits')
+                        .replace('{n}', device.layers_fit));
+                } else {
+                    parts.push(window.t('modal.model_settings.prefill_helper_no_memory'));
+                }
+                return parts.join(' · ');
+            },
+
+            prefillHelperPending() {
+                const saved = this.selectedModel?.settings || {};
+                const ms = this.modelSettings;
+                return (saved.prefill_helper_node_id || '') !== (ms.prefill_helper_node_id || '')
+                    || String(saved.prefill_helper_layers || '') !== String(ms.prefill_helper_layers || '');
+            },
+
+            // Applies the helper choice without closing the dialog, so its
+            // progress and the Copy files step show here.
+            async applyPrefillHelper() {
+                const model = this.selectedModel;
+                const ms = this.modelSettings;
+                if (!model) return;
+                const body = {
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
+                };
+                this.prefillHelper.busy = true;
+                try {
+                    const resp = await fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (resp.ok) {
+                        model.settings = { ...(model.settings || {}), ...body };
+                        this.prefillHelper.applied = true;
+                    } else if (resp.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await resp.json().catch(() => ({}));
+                        alert(typeof data.detail === 'string' ? data.detail : window.t('js.error.save_model_settings_failed'));
+                    }
+                } catch (_) {
+                    alert(window.t('js.error.save_model_settings_failed'));
+                }
+                this.prefillHelper.busy = false;
+            },
+
+            // Cancel undoes an applied helper choice; Save keeps it.
+            closeModelSettings() {
+                this.showModelSettingsModal = false;
+                const model = this.selectedModel;
+                const body = this.prefillHelper.original;
+                if (!this.prefillHelper.applied || !model || !body) return;
+                this.prefillHelper.applied = false;
+                fetch(`/admin/api/models/${encodeURIComponent(model.id)}/settings`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                }).then((resp) => {
+                    if (resp.ok) model.settings = { ...(model.settings || {}), ...body };
+                }).catch(() => { /* network error */ });
+            },
+
+            prefillHelperTakeoverText(device) {
+                if (!device?.lending) return '';
+                return window.t('modal.model_settings.prefill_helper_takes_over')
+                    .replaceAll('{name}', device.name || '')
+                    .replaceAll('{host}', device.lending.host || '?')
+                    .replaceAll('{model}', device.lending.model || '?');
+            },
+
+            prefillHelperLayerChoices() {
+                const device = this.prefillHelperCandidate(this.modelSettings.prefill_helper_node_id);
+                const most = Math.max(
+                    device?.layers_fit || 0,
+                    parseInt(this.modelSettings.prefill_helper_layers, 10) || 0,
+                );
+                return Array.from({ length: most }, (_, i) => i + 1);
+            },
+
+            prefillHelperStatusText() {
+                const s = this.prefillHelper.status;
+                const t = (key) => window.t('modal.model_settings.prefill_helper_state_' + key);
+                if (!s) return t('unloaded');
+                const name = s.name || this.prefillHelperCandidate(s.node_id)?.name || '';
+                const size = (n) => this.formatSizeBytes(Number(n || 0));
+                switch (s.state) {
+                    case 'connecting':
+                        return t('connecting').replace('{name}', name);
+                    case 'starting':
+                        return t('starting').replace('{name}', name).replace('{n}', s.layers ?? '');
+                    case 'needs_files':
+                        return t(s.prompt).replace('{name}', name).replace('{size}', size(s.bytes))
+                            .replace('{left}', size(s.left))
+                            .replace('{copies}', (s.delete || []).map((c) => c.name + ' (' + size(c.bytes) + ')').join(', '));
+                    case 'copying': {
+                        const text = t('copying').replace('{name}', name).replace('{done}', size(s.done))
+                            .replace('{size}', size(s.bytes));
+                        if (s.seconds_left == null) return text;
+                        const left = s.seconds_left < 90
+                            ? t('seconds_left').replace('{n}', s.seconds_left)
+                            : t('minutes_left').replace('{n}', Math.ceil(s.seconds_left / 60));
+                        return text + ' · ' + left;
+                    }
+                    case 'files_ready':
+                        return t('files_ready').replace('{name}', name).replace('{n}', s.held ?? '')
+                            + (this.prefillHelper.applied ? ' ' + t('save_keeps') : '');
+                    case 'files_missing':
+                        return t('files_missing').replace('{name}', name).replace('{n}', s.held ?? '')
+                            .replace('{size}', size(s.bytes));
+                    case 'ready':
+                    case 'working': {
+                        let text = t(s.state).replace('{name}', name).replace('{n}', s.held ?? '');
+                        if (s.last_prompt) {
+                            text += ' · ' + t('last_prompt')
+                                .replace('{tokens}', Number(s.last_prompt.tokens).toLocaleString())
+                                .replace('{seconds}', Number(s.last_prompt.seconds).toFixed(1));
+                        }
+                        return text;
+                    }
+                    case 'offline':
+                        return t('offline').replace('{name}', name).replace('{reason}', s.reason || '');
+                    case 'stopped':
+                        return s.reason ? s.reason + '.' : t('stopped');
+                    case 'error':
+                        return s.reason || t('error');
+                    case 'unloaded':
+                        return t('unloaded');
+                    default:
+                        return '';
+                }
             },
 
             async importMtplxSidecar() {
@@ -2897,23 +3358,52 @@
                 }
             },
 
-            isQwenOqA8Model(model) {
+            // Qwen4 PLE and DeepSeek V4.1 Engram share one row; a model supports at most one.
+            ssdNgramOffloadKey() {
+                if (this.modelSettings.qwen4_ple_ssd_offload_supported) return 'qwen4_ple_ssd_offload';
+                if (this.modelSettings.deepseek_v41_engram_ssd_offload_supported) {
+                    return 'deepseek_v41_engram_ssd_offload';
+                }
+                return null;
+            },
+
+            isA8PrefillModel(model) {
                 const type = String(model?.config_model_type || '').toLowerCase().replaceAll('-', '_');
-                // qwen4_exp (Qwen3.8-Flash-Next) is an exact match: only that
-                // validated family has routed-expert A8, not every qwen4*.
-                return type === 'qwen4_exp'
+                // qwen4_exp (Qwen3.8-Flash-Next) and deepseek_v41 are exact
+                // matches: only those validated families have routed-expert A8.
+                return type === 'qwen4_exp' || type === 'deepseek_v41'
                     || ['qwen3_5', 'qwen3_6', 'qwen3_8'].some(prefix => type.startsWith(prefix));
             },
 
-            validateQwenOqA8Settings() {
-                if (!this.modelSettings.qwen35_oq_a8_enabled) return null;
+            // The kernels need native INT8 tensor ops (M5-series or newer),
+            // here or on the Prefill Accelerator Mac. A saved "on" keeps the
+            // toggle so it can be turned off.
+            showsA8Prefill(model) {
+                return this.isA8PrefillModel(model)
+                    && (model?.a8_prefill_supported === true
+                        || model?.settings?.a8_prefill_enabled === true
+                        || !!this.modelSettings?.prefill_helper_node_id);
+            },
+
+            validateGpuPowerLimit() {
+                if (!this.modelSettings.enableGpuPowerLimit) return null;
+                const watts = Number(this.modelSettings.gpu_power_limit_w);
+                if (!Number.isInteger(watts) || watts < 2 || watts > 1000) {
+                    return window.t('js.error.gpu_power_limit_range');
+                }
+                return null;
+            },
+
+            validateA8PrefillSettings() {
+                if (!this.modelSettings.a8_prefill_enabled
+                    || !this.showsA8Prefill(this.selectedModel)) return null;
                 // Both wrap the same MLP call, so the combination silently
                 // disables one of them. Caught here so the modal explains it
                 // instead of surfacing the server's 400.
                 if (this.modelSettings.qwen35_ane_prefill_enabled) {
                     return window.t('js.error.ane_oq_a8_conflict');
                 }
-                const minTokens = Number(this.modelSettings.qwen35_oq_a8_min_tokens);
+                const minTokens = Number(this.modelSettings.a8_prefill_min_tokens);
                 if (!Number.isInteger(minTokens) || minTokens < 1) {
                     return window.t('js.error.oq_a8_min_tokens_positive');
                 }
@@ -2997,12 +3487,252 @@
                 return null;
             },
 
+            buildModelSettingsPayload(ms) {
+                const isDiffusion = !!ms.is_diffusion_model;
+                // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
+                const chatTemplateKwargs = {};
+                const forcedCtKwargs = [];
+                for (const entry of ms.ctKwargEntries) {
+                    if (entry.type === 'enable_thinking') {
+                        if (isDiffusion) continue;
+                        chatTemplateKwargs.enable_thinking = entry.value === 'true';
+                        if (entry.force) forcedCtKwargs.push('enable_thinking');
+                    } else if (entry.type === 'reasoning_effort') {
+                        if (isDiffusion) continue;
+                        const rawEffort = entry.custom
+                            ? entry.customValue
+                            : entry.value;
+                        const effort = this.coerceKwargValue(rawEffort);
+                        if (String(effort).trim() !== '') {
+                            chatTemplateKwargs.reasoning_effort = effort;
+                            if (entry.force) forcedCtKwargs.push('reasoning_effort');
+                        }
+                    } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
+                        const val = this.coerceKwargValue(entry.value);
+                        const key = entry.key.trim();
+                        if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
+                            continue;
+                        }
+                        chatTemplateKwargs[key] = val;
+                        if (entry.force) forcedCtKwargs.push(key);
+                    }
+                }
+                const payload = {
+                    model_alias: ms.model_alias?.trim() || null,
+                    model_type_override: ms.model_type_override || null,
+                    max_context_window: ms.max_context_window || null,
+                    max_tokens: ms.max_tokens || null,
+                    temperature: Number.isFinite(ms.temperature) ? ms.temperature : null,
+                    top_p: Number.isFinite(ms.top_p) ? ms.top_p : null,
+                    top_k: Number.isFinite(ms.top_k) ? ms.top_k : null,
+                    repetition_penalty: Number.isFinite(ms.repetition_penalty) ? ms.repetition_penalty : null,
+                    min_p: Number.isFinite(ms.min_p) ? ms.min_p : null,
+                    presence_penalty: Number.isFinite(ms.presence_penalty) ? ms.presence_penalty : null,
+                    force_sampling: ms.force_sampling,
+                    reasoning_parser: ms.reasoning_parser || null,
+                    ttl_seconds: ms.ttl_seconds || null,
+                    index_cache_freq: ms.enableIndexCache
+                        ? (ms.index_cache_freq || 4)
+                        : 0,
+                    enable_thinking: this.selectedModel?.thinking_forced ? null : ms.enable_thinking,
+                    qwen4_ple_ssd_offload:
+                        ms.qwen4_ple_ssd_offload_forced
+                            ? !!ms.qwen4_ple_ssd_offload_requested
+                            : !!ms.qwen4_ple_ssd_offload,
+                    prefill_helper_node_id: ms.prefill_helper_node_id || null,
+                    prefill_helper_layers: ms.prefill_helper_node_id && ms.prefill_helper_layers
+                        ? parseInt(ms.prefill_helper_layers, 10)
+                        : null,
+                    qwen4_gdn_decode_wide_proj:
+                        !!ms.qwen4_gdn_decode_wide_proj,
+                    activation_fp16_enabled: !!ms.activation_fp16_enabled,
+                    deepseek_v41_engram_ssd_offload:
+                        ms.deepseek_v41_engram_ssd_offload_forced
+                            ? !!ms.deepseek_v41_engram_ssd_offload_requested
+                            : !!ms.deepseek_v41_engram_ssd_offload,
+                    thinking_budget_enabled: ms.enableThinkingBudget,
+                    thinking_budget_tokens: ms.enableThinkingBudget
+                        ? (ms.thinking_budget_tokens || null)
+                        : 0,
+                    gpu_power_limit_w: ms.enableGpuPowerLimit
+                        ? (Number(ms.gpu_power_limit_w) || 0)
+                        : 0,
+                    guided_grammar_enabled: ms.guided_grammar_enabled,
+                    guided_grammar: ms.guided_grammar_enabled
+                        ? (ms.guided_grammar || null)
+                        : null,
+                    max_tool_result_tokens: ms.enableToolResultLimit
+                        ? (ms.max_tool_result_tokens || null)
+                        : 0,
+                    chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
+                        ? chatTemplateKwargs : null,
+                    forced_ct_kwargs: forcedCtKwargs.length > 0
+                        ? forcedCtKwargs : null,
+                    turboquant_kv_enabled: ms.turboquant_kv_enabled,
+                    turboquant_kv_scheme: ms.turboquant_kv_scheme,
+                    // Affine formats have fixed widths, also while compression is off.
+                    turboquant_kv_bits: ms.turboquant_kv_scheme === 'affine8' ? 8
+                        : ms.turboquant_kv_scheme === 'affine4' ? 4
+                        : ms.turboquant_kv_enabled ? (parseFloat(ms.turboquant_kv_bits) || 4)
+                        : 4,
+                    moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!ms.moe_expert_offload_enabled,
+                    moe_expert_offload_resident_fraction: ms.moe_expert_offload_resident_fraction ?? 0.25,
+                    qwen35_ane_prefill_enabled: !!ms.qwen35_ane_prefill_enabled,
+                    // Validation only runs when the feature is enabled, so a
+                    // blank numeric input must fall back to the server default
+                    // instead of coercing to 0 and failing an unrelated save.
+                    qwen35_ane_prefill_sequence_length: Number(ms.qwen35_ane_prefill_sequence_length) || 2048,
+                    qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(ms.qwen35_ane_prefill_tail_padding_min_tokens))
+                        ? Number(ms.qwen35_ane_prefill_tail_padding_min_tokens)
+                        : 0,
+                    qwen35_ane_prefill_fraction: Number(ms.qwen35_ane_prefill_fraction),
+                    qwen35_ane_prefill_max_layers: Number(ms.qwen35_ane_prefill_max_layers) || 64,
+                    qwen35_ane_prefill_dual_ane: !!ms.qwen35_ane_prefill_dual_ane,
+                    qwen35_ane_prefill_gdn: !!ms.qwen35_ane_prefill_gdn,
+                    qwen35_ane_prefill_gdn_fraction: Number(ms.qwen35_ane_prefill_gdn_fraction) || 0.5,
+                    qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(ms.qwen35_ane_prefill_gdn_max_layers))
+                        ? Number(ms.qwen35_ane_prefill_gdn_max_layers)
+                        : 48,
+                    qwen35_ane_prefill_cpu_enabled: !!ms.qwen35_ane_prefill_cpu_enabled,
+                    qwen35_ane_prefill_cpu_fraction: Number(ms.qwen35_ane_prefill_cpu_fraction),
+                    qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_down_fraction))
+                        ? Number(ms.qwen35_ane_prefill_cpu_down_fraction)
+                        : 0,
+                    qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_gdn_fraction))
+                        ? Number(ms.qwen35_ane_prefill_cpu_gdn_fraction)
+                        : 0,
+                    qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(ms.qwen35_ane_prefill_cpu_threads))
+                        ? Number(ms.qwen35_ane_prefill_cpu_threads)
+                        : 8,
+                    qwen35_ane_prefill_cpu_shared_resource: !!ms.qwen35_ane_prefill_cpu_shared_resource,
+                    specprefill_enabled: ms.specprefill_enabled,
+                    specprefill_draft_model: ms.specprefill_draft_model || null,
+                    specprefill_keep_pct: ms.specprefill_enabled
+                        ? parseFloat(ms.specprefill_keep_pct) || 0.2
+                        : null,
+                    specprefill_threshold: ms.specprefill_enabled
+                        ? (ms.specprefill_threshold || null)
+                        : null,
+                    dflash_enabled: ms.dflash_enabled,
+                    dflash_draft_model: ms.dflash_draft_model || null,
+                    dflash_draft_quant_enabled: ms.dflash_enabled && !!ms.dflash_draft_quant_enabled,
+                    dflash_draft_quant_weight_bits: ms.dflash_enabled && ms.dflash_draft_quant_enabled
+                        ? parseInt(ms.dflash_draft_quant_weight_bits)
+                        : null,
+                    dflash_draft_quant_group_size: ms.dflash_enabled && ms.dflash_draft_quant_enabled
+                        ? parseInt(ms.dflash_draft_quant_group_size)
+                        : null,
+                    // Long-context tuning. Empty → oMLX default.
+                    dflash_draft_window_size: ms.dflash_enabled
+                        && ms.dflash_draft_window_size
+                        ? parseInt(ms.dflash_draft_window_size)
+                        : null,
+                    dflash_block_size: ms.dflash_enabled
+                        && ms.dflash_block_size
+                        ? parseInt(ms.dflash_block_size)
+                        : null,
+                    dflash_verify_mode: ms.dflash_enabled
+                        ? (ms.dflash_verify_mode || 'adaptive')
+                        : null,
+                    mtp_enabled: !!ms.mtp_enabled,
+                    mtp_adaptive_max_depth: ms.mtp_enabled
+                        ? parseInt(ms.mtp_adaptive_max_depth || '3')
+                        : null,
+                    mtp_fixed_depth: null,
+                    qwen35_ane_prefill_shared_fraction: Number(ms.qwen35_ane_prefill_shared_fraction),
+                    vlm_mtp_enabled: !!ms.vlm_mtp_enabled,
+                    vlm_mtp_draft_model: ms.vlm_mtp_enabled
+                        ? (ms.vlm_mtp_draft_model || null)
+                        : null,
+                    vlm_mtp_draft_block_size: ms.vlm_mtp_enabled
+                        && ms.vlm_mtp_draft_block_size
+                        ? parseInt(ms.vlm_mtp_draft_block_size)
+                        : null,
+                    trust_remote_code: ms.trust_remote_code,
+                    external_engine: ms.external_engine || null,
+                };
+                // Sent only where the toggle shows, so an untouched setting
+                // stays unset (on).
+                if (ms.deepseek_v41_ced_prefill_supported) {
+                    payload.deepseek_v41_ced_prefill_enabled = !!ms.deepseek_v41_ced_prefill_enabled;
+                }
+                if (this.showsA8Prefill(this.selectedModel)) {
+                    payload.a8_prefill_enabled = !!ms.a8_prefill_enabled;
+                    payload.a8_prefill_min_tokens = Number(ms.a8_prefill_min_tokens) || 128;
+                }
+                if (isDiffusion) {
+                    Object.assign(payload, {
+                        top_p: null,
+                        top_k: null,
+                        repetition_penalty: null,
+                        min_p: null,
+                        presence_penalty: null,
+                        force_sampling: false,
+                        reasoning_parser: null,
+                        index_cache_freq: 0,
+                        enable_thinking: null,
+                        thinking_budget_enabled: false,
+                        thinking_budget_tokens: 0,
+                        guided_grammar_enabled: false,
+                        guided_grammar: null,
+                        max_tool_result_tokens: 0,
+                        turboquant_kv_enabled: false,
+                        turboquant_kv_scheme: 'turboquant',
+                        turboquant_kv_bits: 4,
+                        qwen35_ane_prefill_enabled: false,
+                        qwen35_ane_prefill_sequence_length: 2048,
+                        qwen35_ane_prefill_tail_padding_min_tokens: 0,
+                        qwen35_ane_prefill_fraction: 0.53,
+                        qwen35_ane_prefill_max_layers: 64,
+                        qwen35_ane_prefill_dual_ane: true,
+                        qwen35_ane_prefill_gdn: true,
+                        qwen35_ane_prefill_gdn_fraction: 0.5,
+                        qwen35_ane_prefill_gdn_max_layers: 48,
+                        qwen35_ane_prefill_cpu_enabled: false,
+                        qwen35_ane_prefill_cpu_fraction: 0.135,
+                        qwen35_ane_prefill_cpu_down_fraction: 0,
+                        qwen35_ane_prefill_cpu_gdn_fraction: 0,
+                        qwen35_ane_prefill_cpu_threads: 8,
+                        qwen35_ane_prefill_cpu_shared_resource: true,
+                        specprefill_enabled: false,
+                        specprefill_draft_model: null,
+                        specprefill_keep_pct: null,
+                        specprefill_threshold: null,
+                        external_engine: null,
+                        dflash_enabled: false,
+                        dflash_draft_model: null,
+                        dflash_draft_quant_enabled: false,
+                        dflash_draft_quant_weight_bits: null,
+                        dflash_draft_quant_group_size: null,
+                        dflash_draft_window_size: null,
+                        dflash_block_size: null,
+                        dflash_verify_mode: null,
+                        mtp_enabled: false,
+                        mtp_adaptive_max_depth: null,
+                        mtp_fixed_depth: null,
+                        vlm_mtp_enabled: false,
+                        vlm_mtp_draft_model: null,
+                        vlm_mtp_draft_block_size: null,
+                    });
+                }
+                if (this.selectedModel?.embedding_audio_supported) {
+                    const audioSeconds = Number(ms.embedding_audio_max_seconds);
+                    Object.assign(payload, {
+                        embedding_audio_enabled: !!ms.embedding_audio_enabled,
+                        // Empty keeps the 30 s processor default.
+                        embedding_audio_max_seconds: audioSeconds > 0 ? audioSeconds : null,
+                    });
+                }
+                return payload;
+            },
+
             async saveModelSettings() {
+                if (this.savingModelSettings) return;
                 if (!this.selectedModel) return;
 
-                const qwenOqA8ValidationError = this.validateQwenOqA8Settings();
-                if (qwenOqA8ValidationError) {
-                    alert(qwenOqA8ValidationError);
+                const a8PrefillValidationError = this.validateA8PrefillSettings();
+                if (a8PrefillValidationError) {
+                    alert(a8PrefillValidationError);
                     return;
                 }
 
@@ -3012,268 +3742,39 @@
                     return;
                 }
 
+                const gpuPowerLimitError = this.validateGpuPowerLimit();
+                if (gpuPowerLimitError) {
+                    alert(gpuPowerLimitError);
+                    return;
+                }
+
                 this.savingModelSettings = true;
                 try {
+                    const payload = this.buildModelSettingsPayload(this.modelSettings);
+                    if (this._modelSettingsBaseline) {
+                        // Send only edited fields so a stale form does not overwrite other changes.
+                        // Always send mtp_fixed_depth: null to clear a legacy fixed depth.
+                        const initial = this.buildModelSettingsPayload(
+                            JSON.parse(this._modelSettingsBaseline),
+                        );
+                        for (const key of Object.keys(payload)) {
+                            if (key !== 'mtp_fixed_depth'
+                                && JSON.stringify(payload[key]) === JSON.stringify(initial[key])) {
+                                delete payload[key];
+                            }
+                        }
+                    }
                     const response = await fetch(`/admin/api/models/${encodeURIComponent(this.selectedModel.id)}/settings`, {
                         method: 'PUT',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify((() => {
-                            const isDiffusion = !!this.modelSettings.is_diffusion_model;
-                            // Build chat_template_kwargs and forced_ct_kwargs from ctKwargEntries
-                            const chatTemplateKwargs = {};
-                            const forcedCtKwargs = [];
-                            for (const entry of this.modelSettings.ctKwargEntries) {
-                                if (entry.type === 'enable_thinking') {
-                                    if (isDiffusion) continue;
-                                    chatTemplateKwargs.enable_thinking = entry.value === 'true';
-                                    if (entry.force) forcedCtKwargs.push('enable_thinking');
-                                } else if (entry.type === 'reasoning_effort') {
-                                    if (isDiffusion) continue;
-                                    const rawEffort = entry.custom
-                                        ? entry.customValue
-                                        : entry.value;
-                                    const effort = this.coerceKwargValue(rawEffort);
-                                    if (String(effort).trim() !== '') {
-                                        chatTemplateKwargs.reasoning_effort = effort;
-                                        if (entry.force) forcedCtKwargs.push('reasoning_effort');
-                                    }
-                                } else if (entry.type === 'custom' && entry.key && entry.key.trim()) {
-                                    const val = this.coerceKwargValue(entry.value);
-                                    const key = entry.key.trim();
-                                    if (isDiffusion && this.isDiffusionUnsupportedCtKwarg(key)) {
-                                        continue;
-                                    }
-                                    chatTemplateKwargs[key] = val;
-                                    if (entry.force) forcedCtKwargs.push(key);
-                                }
-                            }
-                            const payload = {
-                                model_alias: this.modelSettings.model_alias?.trim() || null,
-                                model_type_override: this.modelSettings.model_type_override || null,
-                                max_context_window: this.modelSettings.max_context_window || null,
-                                max_tokens: this.modelSettings.max_tokens || null,
-                                temperature: Number.isFinite(this.modelSettings.temperature) ? this.modelSettings.temperature : null,
-                                top_p: Number.isFinite(this.modelSettings.top_p) ? this.modelSettings.top_p : null,
-                                top_k: Number.isFinite(this.modelSettings.top_k) ? this.modelSettings.top_k : null,
-                                repetition_penalty: Number.isFinite(this.modelSettings.repetition_penalty) ? this.modelSettings.repetition_penalty : null,
-                                min_p: Number.isFinite(this.modelSettings.min_p) ? this.modelSettings.min_p : null,
-                                presence_penalty: Number.isFinite(this.modelSettings.presence_penalty) ? this.modelSettings.presence_penalty : null,
-                                force_sampling: this.modelSettings.force_sampling,
-                                reasoning_parser: this.modelSettings.reasoning_parser || null,
-                                ttl_seconds: this.modelSettings.ttl_seconds || null,
-                                index_cache_freq: this.modelSettings.enableIndexCache
-                                    ? (this.modelSettings.index_cache_freq || 4)
-                                    : 0,
-                                enable_thinking: this.selectedModel?.thinking_forced ? null : this.modelSettings.enable_thinking,
-                                qwen4_ple_ssd_offload:
-                                    !!this.modelSettings.qwen4_ple_ssd_offload,
-                                deepseek_v41_ced_prefill_enabled:
-                                    !!this.modelSettings.deepseek_v41_ced_prefill_enabled,
-                                deepseek_v41_engram_ssd_offload:
-                                    this.modelSettings.deepseek_v41_engram_ssd_offload_forced
-                                        ? !!this.modelSettings.deepseek_v41_engram_ssd_offload_requested
-                                        : !!this.modelSettings.deepseek_v41_engram_ssd_offload,
-                                thinking_budget_enabled: this.modelSettings.enableThinkingBudget,
-                                thinking_budget_tokens: this.modelSettings.enableThinkingBudget
-                                    ? (this.modelSettings.thinking_budget_tokens || null)
-                                    : 0,
-                                guided_grammar_enabled: this.modelSettings.guided_grammar_enabled,
-                                guided_grammar: this.modelSettings.guided_grammar_enabled
-                                    ? (this.modelSettings.guided_grammar || null)
-                                    : null,
-                                max_tool_result_tokens: this.modelSettings.enableToolResultLimit
-                                    ? (this.modelSettings.max_tool_result_tokens || null)
-                                    : 0,
-                                chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
-                                    ? chatTemplateKwargs : null,
-                                forced_ct_kwargs: forcedCtKwargs.length > 0
-                                    ? forcedCtKwargs : null,
-                                turboquant_kv_enabled: this.modelSettings.turboquant_kv_enabled,
-                                turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
-                                    ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
-                                    : 4,
-                                moe_expert_offload_enabled: !isDiffusion && this.selectedModel?.moe_expert_offload_supported === true && !!this.modelSettings.moe_expert_offload_enabled,
-                                moe_expert_offload_resident_fraction: this.modelSettings.moe_expert_offload_resident_fraction ?? 0.25,
-                                qwen35_oq_a8_enabled: !!this.modelSettings.qwen35_oq_a8_enabled,
-                                qwen35_oq_a8_min_tokens: Number(this.modelSettings.qwen35_oq_a8_min_tokens) || 128,
-                                qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
-                                // Validation only runs when the feature is enabled, so a
-                                // blank numeric input must fall back to the server default
-                                // instead of coercing to 0 and failing an unrelated save.
-                                qwen35_ane_prefill_sequence_length: Number(this.modelSettings.qwen35_ane_prefill_sequence_length) || 2048,
-                                qwen35_ane_prefill_tail_padding_min_tokens: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens)
-                                    : 0,
-                                qwen35_ane_prefill_fraction: Number(this.modelSettings.qwen35_ane_prefill_fraction),
-                                qwen35_ane_prefill_max_layers: Number(this.modelSettings.qwen35_ane_prefill_max_layers) || 64,
-                                qwen35_ane_prefill_dual_ane: !!this.modelSettings.qwen35_ane_prefill_dual_ane,
-                                qwen35_ane_prefill_gdn: !!this.modelSettings.qwen35_ane_prefill_gdn,
-                                qwen35_ane_prefill_gdn_fraction: Number(this.modelSettings.qwen35_ane_prefill_gdn_fraction) || 0.5,
-                                qwen35_ane_prefill_gdn_max_layers: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_gdn_max_layers)
-                                    : 48,
-                                qwen35_ane_prefill_cpu_enabled: !!this.modelSettings.qwen35_ane_prefill_cpu_enabled,
-                                qwen35_ane_prefill_cpu_fraction: Number(this.modelSettings.qwen35_ane_prefill_cpu_fraction),
-                                qwen35_ane_prefill_cpu_down_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_down_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_gdn_fraction: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_gdn_fraction)
-                                    : 0,
-                                qwen35_ane_prefill_cpu_threads: Number.isFinite(Number(this.modelSettings.qwen35_ane_prefill_cpu_threads))
-                                    ? Number(this.modelSettings.qwen35_ane_prefill_cpu_threads)
-                                    : 8,
-                                qwen35_ane_prefill_cpu_shared_resource: !!this.modelSettings.qwen35_ane_prefill_cpu_shared_resource,
-                                specprefill_enabled: this.modelSettings.specprefill_enabled,
-                                specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
-                                specprefill_keep_pct: this.modelSettings.specprefill_enabled
-                                    ? parseFloat(this.modelSettings.specprefill_keep_pct) || 0.2
-                                    : null,
-                                specprefill_threshold: this.modelSettings.specprefill_enabled
-                                    ? (this.modelSettings.specprefill_threshold || null)
-                                    : null,
-                                dflash_enabled: this.modelSettings.dflash_enabled,
-                                dflash_draft_model: this.modelSettings.dflash_draft_model || null,
-                                dflash_draft_quant_enabled: this.modelSettings.dflash_enabled && !!this.modelSettings.dflash_draft_quant_enabled,
-                                dflash_draft_quant_weight_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_weight_bits)
-                                    : null,
-                                dflash_draft_quant_activation_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_activation_bits)
-                                    : null,
-                                dflash_draft_quant_group_size: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_enabled
-                                    ? parseInt(this.modelSettings.dflash_draft_quant_group_size)
-                                    : null,
-                                dflash_max_ctx: this.modelSettings.dflash_enabled && this.modelSettings.dflash_max_ctx
-                                    ? parseInt(this.modelSettings.dflash_max_ctx)
-                                    : null,
-                                dflash_in_memory_cache: this.modelSettings.dflash_enabled
-                                    ? !!this.modelSettings.dflash_in_memory_cache
-                                    : true,
-                                dflash_in_memory_cache_max_entries: this.modelSettings.dflash_enabled
-                                    ? (parseInt(this.modelSettings.dflash_in_memory_cache_max_entries) || 4)
-                                    : 4,
-                                dflash_in_memory_cache_max_bytes: this.modelSettings.dflash_enabled
-                                    ? Math.max(1, parseInt(this.modelSettings.dflash_in_memory_cache_max_gib) || 8) * (1024 ** 3)
-                                    : 8 * (1024 ** 3),
-                                dflash_ssd_cache: this.modelSettings.dflash_enabled
-                                    && !!this.modelSettings.dflash_in_memory_cache
-                                    && !!this.modelSettings.dflash_ssd_cache_available
-                                    && !!this.modelSettings.dflash_ssd_cache,
-                                dflash_ssd_cache_max_bytes: this.modelSettings.dflash_enabled
-                                    ? Math.max(1, parseInt(this.modelSettings.dflash_ssd_cache_max_gib) || 20) * (1024 ** 3)
-                                    : 20 * (1024 ** 3),
-                                // Long-context tuning. Empty → oMLX default.
-                                dflash_draft_window_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_draft_window_size
-                                    ? parseInt(this.modelSettings.dflash_draft_window_size)
-                                    : null,
-                                dflash_draft_sink_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_draft_sink_size !== null
-                                    && this.modelSettings.dflash_draft_sink_size !== undefined
-                                    && this.modelSettings.dflash_draft_sink_size !== ''
-                                    ? parseInt(this.modelSettings.dflash_draft_sink_size)
-                                    : 0,
-                                dflash_block_size: this.modelSettings.dflash_enabled
-                                    && this.modelSettings.dflash_block_size
-                                    ? parseInt(this.modelSettings.dflash_block_size)
-                                    : null,
-                                dflash_verify_mode: this.modelSettings.dflash_enabled
-                                    ? (this.modelSettings.dflash_verify_mode || 'adaptive')
-                                    : null,
-                                mtp_enabled: !!this.modelSettings.mtp_enabled,
-                                mtp_adaptive_max_depth: this.modelSettings.mtp_enabled
-                                    ? parseInt(this.modelSettings.mtp_adaptive_max_depth || '3')
-                                    : null,
-                                mtp_fixed_depth: null,
-                                qwen35_ane_prefill_shared_fraction: Number(this.modelSettings.qwen35_ane_prefill_shared_fraction),
-                                vlm_mtp_enabled: !!this.modelSettings.vlm_mtp_enabled,
-                                vlm_mtp_draft_model: this.modelSettings.vlm_mtp_enabled
-                                    ? (this.modelSettings.vlm_mtp_draft_model || null)
-                                    : null,
-                                vlm_mtp_draft_block_size: this.modelSettings.vlm_mtp_enabled
-                                    && this.modelSettings.vlm_mtp_draft_block_size
-                                    ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
-                                    : null,
-                                trust_remote_code: this.modelSettings.trust_remote_code,
-                            };
-                            if (isDiffusion) {
-                                Object.assign(payload, {
-                                    top_p: null,
-                                    top_k: null,
-                                    repetition_penalty: null,
-                                    min_p: null,
-                                    presence_penalty: null,
-                                    force_sampling: false,
-                                    reasoning_parser: null,
-                                    index_cache_freq: 0,
-                                    enable_thinking: null,
-                                    thinking_budget_enabled: false,
-                                    thinking_budget_tokens: 0,
-                                    guided_grammar_enabled: false,
-                                    guided_grammar: null,
-                                    max_tool_result_tokens: 0,
-                                    turboquant_kv_enabled: false,
-                                    turboquant_kv_bits: 4,
-                                    qwen35_ane_prefill_enabled: false,
-                                    qwen35_ane_prefill_sequence_length: 2048,
-                                    qwen35_ane_prefill_tail_padding_min_tokens: 0,
-                                    qwen35_ane_prefill_fraction: 0.53,
-                                    qwen35_ane_prefill_max_layers: 64,
-                                    qwen35_ane_prefill_dual_ane: true,
-                                    qwen35_ane_prefill_gdn: true,
-                                    qwen35_ane_prefill_gdn_fraction: 0.5,
-                                    qwen35_ane_prefill_gdn_max_layers: 48,
-                                    qwen35_ane_prefill_cpu_enabled: false,
-                                    qwen35_ane_prefill_cpu_fraction: 0.135,
-                                    qwen35_ane_prefill_cpu_down_fraction: 0,
-                                    qwen35_ane_prefill_cpu_gdn_fraction: 0,
-                                    qwen35_ane_prefill_cpu_threads: 8,
-                                    qwen35_ane_prefill_cpu_shared_resource: true,
-                                    specprefill_enabled: false,
-                                    specprefill_draft_model: null,
-                                    specprefill_keep_pct: null,
-                                    specprefill_threshold: null,
-                                    dflash_enabled: false,
-                                    dflash_draft_model: null,
-                                    dflash_draft_quant_enabled: false,
-                                    dflash_draft_quant_weight_bits: null,
-                                    dflash_draft_quant_activation_bits: null,
-                                    dflash_draft_quant_group_size: null,
-                                    dflash_max_ctx: null,
-                                    dflash_in_memory_cache: true,
-                                    dflash_in_memory_cache_max_entries: 4,
-                                    dflash_in_memory_cache_max_bytes: 8 * (1024 ** 3),
-                                    dflash_ssd_cache: false,
-                                    dflash_ssd_cache_max_bytes: 20 * (1024 ** 3),
-                                    dflash_draft_window_size: null,
-                                    dflash_draft_sink_size: null,
-                                    dflash_block_size: null,
-                                    dflash_verify_mode: null,
-                                    mtp_enabled: false,
-                                    mtp_adaptive_max_depth: null,
-                                    mtp_fixed_depth: null,
-                                    vlm_mtp_enabled: false,
-                                    vlm_mtp_draft_model: null,
-                                    vlm_mtp_draft_block_size: null,
-                                });
-                            }
-                            if (this.selectedModel?.embedding_audio_supported) {
-                                const audioSeconds = Number(this.modelSettings.embedding_audio_max_seconds);
-                                Object.assign(payload, {
-                                    embedding_audio_enabled: !!this.modelSettings.embedding_audio_enabled,
-                                    // Empty keeps the 30 s processor default.
-                                    embedding_audio_max_seconds: audioSeconds > 0 ? audioSeconds : null,
-                                });
-                            }
-                            return payload;
-                        })()),
+                        body: JSON.stringify(payload),
                     });
 
                     if (response.ok) {
                         // Refresh the model list to update badges
                         await this.loadModels();
                         const data = await response.json();
+                        this.prefillHelper.applied = false;
                         this.showModelSettingsModal = false;
                         if (data.requires_reload) {
                             if (data.auto_reloaded) {
@@ -3290,7 +3791,8 @@
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json();
-                        alert(data.detail || window.t('js.error.save_model_settings_failed'));
+                        // Request validation errors (422) carry a list of objects.
+                        alert(Array.isArray(data.detail) ? data.detail.map(e => (e && typeof e === 'object') ? (e.msg || JSON.stringify(e)) : String(e)).join(', ') : (data.detail || window.t('js.error.save_model_settings_failed')));
                     }
                 } catch (err) {
                     console.error('Failed to save model settings:', err);
@@ -3484,10 +3986,13 @@
                         this.modelSettings.enable_thinking = false;
                         this.modelSettings.enableThinkingBudget = false;
                         this.modelSettings.thinking_budget_tokens = 0;
+                        this.modelSettings.enableGpuPowerLimit = false;
+                        this.modelSettings.gpu_power_limit_w = null;
                         this.modelSettings.enableToolResultLimit = false;
                         this.modelSettings.max_tool_result_tokens = 0;
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
+                        this.modelSettings.turboquant_kv_scheme = 'turboquant';
                         this.modelSettings.turboquant_kv_bits = 4;
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
@@ -3512,16 +4017,8 @@
                         this.modelSettings.dflash_draft_model = null;
                         this.modelSettings.dflash_draft_quant_enabled = false;
                         this.modelSettings.dflash_draft_quant_weight_bits = null;
-                        this.modelSettings.dflash_draft_quant_activation_bits = null;
                         this.modelSettings.dflash_draft_quant_group_size = null;
-                        this.modelSettings.dflash_max_ctx = null;
-                        this.modelSettings.dflash_in_memory_cache = true;
-                        this.modelSettings.dflash_in_memory_cache_max_entries = 4;
-                        this.modelSettings.dflash_in_memory_cache_max_gib = 8;
-                        this.modelSettings.dflash_ssd_cache = false;
-                        this.modelSettings.dflash_ssd_cache_max_gib = 20;
                         this.modelSettings.dflash_draft_window_size = null;
-                        this.modelSettings.dflash_draft_sink_size = 0;
                         this.modelSettings.dflash_block_size = null;
                         this.modelSettings.dflash_verify_mode = 'adaptive';
                         this.modelSettings.mtp_enabled = false;
@@ -3721,6 +4218,17 @@
             },
 
             get claudeCodeCommand() {
+                return this._claudeCodeCommand(this.stats.api_key);
+            },
+
+            // On-screen variant with the auth token masked (sub-key style), so
+            // the rendered dashboard never exposes the API key; the copy
+            // button still copies the real claudeCodeCommand.
+            get claudeCodeCommandDisplay() {
+                return this._claudeCodeCommand(this.stats.api_key ? '••••••••' : '');
+            },
+
+            _claudeCodeCommand(authToken) {
                 const mode = this.globalSettings.claude_code.mode;
                 if (mode === 'cloud') {
                     return 'env -u ANTHROPIC_BASE_URL -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_DEFAULT_OPUS_MODEL -u ANTHROPIC_DEFAULT_SONNET_MODEL -u ANTHROPIC_DEFAULT_HAIKU_MODEL -u API_TIMEOUT_MS -u CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC claude';
@@ -3732,8 +4240,8 @@
                 const haikuModel = this.globalSettings.claude_code.haiku_model || 'select-a-model';
                 const parts = [];
                 parts.push(this.shellEnvAssign('ANTHROPIC_BASE_URL', `http://${this.displayHost}:${port}`));
-                if (this.stats.api_key) {
-                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', this.stats.api_key));
+                if (authToken) {
+                    parts.push(this.shellEnvAssign('ANTHROPIC_AUTH_TOKEN', authToken));
                 }
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_OPUS_MODEL', opusModel));
                 parts.push(this.shellEnvAssign('ANTHROPIC_DEFAULT_SONNET_MODEL', sonnetModel));
@@ -3756,11 +4264,15 @@
                             claude_code_opus_model: this.globalSettings.claude_code.opus_model,
                             claude_code_sonnet_model: this.globalSettings.claude_code.sonnet_model,
                             claude_code_haiku_model: this.globalSettings.claude_code.haiku_model,
+                            claude_code_desktop_enabled: this.globalSettings.claude_code.desktop_enabled,
                         }),
                     });
                     if (!response.ok) {
                         console.error('Failed to save Claude Code settings');
                     }
+                    // The toggle writes/restores the Claude Desktop gateway
+                    // profile server-side; refresh the shown state.
+                    this.fetchClaudeDesktopStatus();
                 } catch (err) {
                     console.error('Failed to save Claude Code settings:', err);
                 }
@@ -3800,7 +4312,7 @@
                     return {
                         id,
                         label: window.t(tile.label),
-                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatNumber(raw),
+                        value: tile.unit === '%' ? raw.toFixed(1) : this.formatServingCount(raw),
                         unit: tile.unit || '',
                     };
                 });
@@ -4055,6 +4567,71 @@
                 }
             },
 
+            async fetchClaudeDesktopStatus() {
+                try {
+                    const response = await fetch('/admin/api/claude-desktop/status');
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                } catch (err) {
+                    console.error('Failed to fetch Claude Desktop status:', err);
+                }
+            },
+
+            async reapplyClaudeDesktopConfig() {
+                this.claudeDesktop.working = true;
+                this.claudeDesktop.message = '';
+                try {
+                    const enabled = !!this.globalSettings.claude_code.desktop_enabled;
+                    const endpoint = enabled
+                        ? '/admin/api/claude-desktop/configure'
+                        : '/admin/api/claude-desktop/restore';
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    if (!response.ok) {
+                        console.error('Failed to apply Claude Desktop configuration');
+                        return;
+                    }
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                } catch (err) {
+                    console.error('Failed to apply Claude Desktop configuration:', err);
+                } finally {
+                    this.claudeDesktop.working = false;
+                }
+            },
+
+            async restoreClaudeDesktopConfig() {
+                if (this.claudeDesktop.working) return;
+                this.claudeDesktop.working = true;
+                this.claudeDesktop.message = '';
+                try {
+                    const response = await fetch('/admin/api/claude-desktop/restore', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({}),
+                    });
+                    if (!response.ok) {
+                        this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                        return;
+                    }
+                    const data = await response.json();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.globalSettings.claude_code.desktop_enabled = false;
+                    await this.saveClaudeCodeSettings();
+                    this.claudeDesktop.configured = !!data.configured;
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_success');
+                } catch (err) {
+                    console.error('Failed to restore Claude Desktop configuration:', err);
+                    this.claudeDesktop.message = window.t('status.claude_code.desktop_restore_error');
+                } finally {
+                    this.claudeDesktop.working = false;
+                }
+            },
+
             _launchCmd(tool) {
                 const raw = this.stats.cli_prefix || 'omlx';
                 const cli = raw === 'omlx' ? raw : this.shellQuote(raw);
@@ -4063,6 +4640,10 @@
 
             get claudeCommand() {
                 return this._launchCmd('claude');
+            },
+
+            get claudeDesktopCommand() {
+                return this._launchCmd('claude_desktop');
             },
 
             get codexCommand() {
@@ -4094,6 +4675,12 @@
                 return this._launchCmd('pi');
             },
 
+            get vibeCommand() {
+                const model = this.globalSettings.integrations.vibe_model;
+                const command = this._launchCmd('vibe');
+                return model ? `${command} --model ${this.shellQuote(model)}` : command;
+            },
+
             get dshCommand() {
                 return this._launchCmd('dsh');
             },
@@ -4122,6 +4709,7 @@
                             integrations_openclaw_model: this.globalSettings.integrations.openclaw_model,
                             integrations_hermes_model: this.globalSettings.integrations.hermes_model,
                             integrations_pi_model: this.globalSettings.integrations.pi_model,
+                            integrations_vibe_model: this.globalSettings.integrations.vibe_model,
                             integrations_dsh_model: this.globalSettings.integrations.dsh_model,
                             integrations_openclaw_tools_profile: this.globalSettings.integrations.openclaw_tools_profile,
                             markitdown_enabled: this.globalSettings.integrations.markitdown_enabled,
@@ -4137,14 +4725,123 @@
                             web_search_content_mode: this.globalSettings.integrations.web_search_content_mode,
                             web_search_content_truncate: this.globalSettings.integrations.web_search_content_truncate,
                             web_search_content_max_chars: this.globalSettings.integrations.web_search_content_max_chars,
+                            splash_path: this.globalSettings.integrations.splash_path,
+                            splash_kv_format: this.globalSettings.integrations.splash_kv_format,
+                            splash_max_memory_gb: this.globalSettings.integrations.splash_max_memory_gb,
+                            splash_ssd_cache_gb: this.globalSettings.integrations.splash_ssd_cache_gb,
+                            splash_ane_prefill: this.globalSettings.integrations.splash_ane_prefill,
                         }),
                     });
                     if (!response.ok) {
+                        const data = await response.json().catch(() => ({}));
                         console.error('Failed to save integration settings');
+                        return data.detail || window.t('settings.integrations.save_failed');
                     }
                 } catch (err) {
                     console.error('Failed to save integration settings:', err);
+                    return String(err);
                 }
+                return '';
+            },
+
+            // Number inputs where an empty field means "automatic".
+            optionalNumber(value) {
+                return value === '' || value === null || value === undefined ? null : Number(value);
+            },
+
+            // The first external engine that can serve the model, or ''.
+            firstUsableExternalEngine() {
+                const usable = (this.modelSettings.external_engines || []).find(e => e.compatible);
+                return usable ? usable.id : '';
+            },
+
+            isGgufModel() {
+                return this.modelSettings.model_format === 'gguf';
+            },
+
+            // A GGUF runs on an external engine even when its settings pick none.
+            effectiveExternalEngine() {
+                if (this.modelSettings.external_engine) return this.modelSettings.external_engine;
+                if (!this.isGgufModel()) return '';
+                return this.firstUsableExternalEngine() || this.modelSettings.external_engines?.[0]?.id || '';
+            },
+
+            externalEngineDraftRepo() {
+                const engines = this.modelSettings.external_engines || [];
+                const engine = engines.find(e => e.id === this.effectiveExternalEngine()) || engines[0];
+                return engine && !engine.compatible ? engine.draft_repo || '' : '';
+            },
+
+            async downloadEngineDraft() {
+                const repoId = this.externalEngineDraftRepo();
+                if (!repoId) return;
+                try {
+                    const response = await fetch('/admin/api/hf/download', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_id: repoId, hf_token: this.hfToken }),
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        alert(data.detail || window.t('js.error.start_download_failed'));
+                        return;
+                    }
+                    alert(window.t('js.success.download_started').replace('{repo_id}', repoId));
+                    await this.loadHFTasks();
+                    this.startHFRefresh();
+                } catch (err) {
+                    alert(window.t('js.error.hf_connect_failed'));
+                }
+            },
+
+            externalEngineReason() {
+                const engines = this.modelSettings.external_engines || [];
+                const selected = engines.find(e => e.id === this.effectiveExternalEngine());
+                if (selected) return selected.compatible ? '' : selected.reason;
+                return engines.some(e => e.compatible) ? '' : (engines[0]?.reason || '');
+            },
+
+            // Saves a Splash size in GB; empty means automatic. A value the
+            // server would reject is put back so later saves keep working.
+            async saveSplashSize(field, input, minimum) {
+                const previous = this.globalSettings.integrations[field];
+                const value = this.optionalNumber(input.value);
+                let error = '';
+                if (value !== null && !(value >= minimum)) {
+                    error = window.t('settings.integrations.splash.invalid_size');
+                } else {
+                    this.globalSettings.integrations[field] = value;
+                    error = await this.saveIntegrationSettings();
+                }
+                if (error) {
+                    this.globalSettings.integrations[field] = previous;
+                    input.value = previous ?? '';
+                }
+                this.splashOptionsError = error;
+            },
+
+            editSplashPath() {
+                const splash = this.globalSettings.external_engines.splash;
+                this.splashPath.draft = this.globalSettings.integrations.splash_path || splash.path || '';
+                this.splashPath.error = '';
+                this.splashPath.editing = true;
+            },
+
+            async applySplashPath(path) {
+                this.splashPath.saving = true;
+                this.splashPath.error = '';
+                const previous = this.globalSettings.integrations.splash_path;
+                this.globalSettings.integrations.splash_path = (path || '').trim() || null;
+                const error = await this.saveIntegrationSettings();
+                if (error) {
+                    this.globalSettings.integrations.splash_path = previous;
+                    this.splashPath.error = error;
+                } else {
+                    this.splashPath.editing = false;
+                    await this.loadGlobalSettings();
+                    this.loadModels();
+                }
+                this.splashPath.saving = false;
             },
 
             ddgsBackendChecked(name) {
@@ -4276,11 +4973,15 @@
             async clearSsdCache() {
                 try {
                     const resp = await fetch('/admin/api/ssd-cache/clear', { method: 'POST' });
-                    if (!resp.ok) console.error('SSD cache clear failed:', resp.status);
+                    if (!resp.ok) {
+                        const data = await resp.json();
+                        throw new Error(data.detail || window.t('js.error.clear_ssd_cache_failed'));
+                    }
                     this.showClearSsdCacheConfirm = false;
                     await this.loadStats();
                 } catch (err) {
                     console.error('Failed to clear SSD cache:', err);
+                    alert(err.message || window.t('js.error.clear_ssd_cache_failed'));
                     this.showClearSsdCacheConfirm = false;
                 }
             },
@@ -4313,11 +5014,23 @@
             },
 
             formatNumber(num) {
-                const chinese = chineseCount(num);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(num);
+                if (compact != null) return compact;
                 if (num >= 1000000000) return (num / 1000000000).toFixed(1) + 'B';
                 if (num >= 10000000) return (num / 1000000).toFixed(1) + 'M';
                 return num.toLocaleString();
+            },
+
+            setStatsNumberScale(value) {
+                this.statsNumberScale = value;
+                window.omlxCount?.setScale?.(value);
+            },
+
+            formatServingCount(value) {
+                if (this.statsNumberScale === 'exact') {
+                    return window.omlxCount.exact(value);
+                }
+                return this.formatNumber(value);
             },
 
             cacheObsCumulative(stats, selectedModel) {
@@ -4365,36 +5078,11 @@
             },
 
             formatTokenCount(n) {
-                const chinese = chineseCount(n);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(n);
+                if (compact != null) return compact;
                 if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
                 if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
                 return String(n);
-            },
-
-            formatDFlashSessionStats(totals) {
-                if (!totals || totals.requests <= 1) return '';
-
-                const parts = [];
-                if (totals.speculative_requests > 0) {
-                    parts.push(
-                        Math.round((totals.acceptance_ratio || 0) * 100) + '% ' +
-                        window.t('status.active_models.dflash_draft_share'),
-                        (totals.accepted_draft_tokens_per_cycle || 0).toFixed(2) + ' ' +
-                        window.t('status.active_models.dflash_accepted_draft_per_cycle'),
-                        (totals.tokens_per_cycle || 0).toFixed(2) + ' ' +
-                        window.t('status.active_models.dflash_output_per_cycle'),
-                        totals.speculative_requests + ' ' +
-                        window.t('status.active_models.dflash_speculative_requests'),
-                    );
-                }
-                if (totals.fallback_requests > 0) {
-                    parts.push(
-                        totals.fallback_requests + ' ' +
-                        window.t('status.active_models.dflash_fallback_requests'),
-                    );
-                }
-                return window.t('status.active_models.dflash_session') + ': ' + parts.join(' · ');
             },
 
             formatDurationShort(seconds) {
@@ -4458,11 +5146,12 @@
 
             get activeModelsPressureBarColor() {
                 const pct = this.activeModelsPressurePercent;
-                if (pct >= 90) return 'rgb(var(--palette-red-500))';
-                if (pct >= 80) return 'rgb(var(--palette-orange-500))';
-                if (pct >= 70) return 'rgb(var(--palette-amber-500))';
-                if (pct >= 60) return 'rgb(var(--palette-yellow-400))';
-                return 'rgb(var(--palette-green-500))';
+                if (pct >= 90) return 'var(--danger)';
+                // custom_theme.js sets --meter-high/--meter-mid only for custom status roles.
+                if (pct >= 80) return 'var(--meter-high, rgb(var(--palette-orange-500)))';
+                if (pct >= 70) return 'var(--warning)';
+                if (pct >= 60) return 'var(--meter-mid, rgb(var(--palette-yellow-400)))';
+                return 'var(--success)';
             },
 
             get activeModelsPressureBarStyle() {
@@ -4550,6 +5239,11 @@
                 } else {
                     this._copyFallback(text);
                 }
+            },
+
+            // Name clients send for a model: its alias when set, as /v1/models lists it.
+            apiModelName(id) {
+                return this.managerModelInfo(id)?.settings?.model_alias || id;
             },
 
             _copyFallback(text) {
@@ -4980,6 +5674,12 @@
                 return window.t('ctx_bench.capped.memory');
             },
 
+            // A model's GPU power limit; benchmarks always run without it.
+            benchGpuPowerLimit(modelId) {
+                const m = this.models.find(m => m.id === modelId);
+                return m?.settings?.gpu_power_limit_w || 0;
+            },
+
             // Native context length of the selected bench model (0 = unknown).
             ctxBenchNativeLimit() {
                 const m = this.models.find(m => m.id === this.ctxBenchModelId);
@@ -5136,7 +5836,7 @@
                     lines.push('');
                     lines.push(window.t('bench.results.single.section_label'));
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('pp TPS', 12), pad('tg TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
+                    const hdr = [rpad(window.t('bench.results.single.test'), 32), pad('TTFT(ms)', 10), pad('TPOT(ms)', 10), pad('PP TPS', 12), pad('TG TPS', 12), pad('E2E(s)', 10), pad(window.t('bench.results.single.throughput'), 12), pad(window.t('bench.results.single.peak_mem'), 10)];
                     lines.push(hdr.join('  '));
                     for (const r of this.benchSingleResults) {
                         const row = [
@@ -5161,7 +5861,7 @@
                     lines.push(`${title}`);
                     lines.push(subtitle);
                     lines.push('-'.repeat(80));
-                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('tg TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('pp TPS', 12), pad('pp TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
+                    const hdr = [rpad(window.t('bench.results.text_export.batch'), 8), pad('TG TPS', 12), pad(window.t('bench.results.batch.speedup'), 8), pad('PP TPS', 12), pad('PP TPS/req', 12), pad('TTFT(ms)', 10), pad('E2E(s)', 10)];
                     lines.push(hdr.join('  '));
                     if (baseline) {
                         const row = [
@@ -6300,8 +7000,7 @@
             // the user clicks rapidly.
             wiredLimitCopied: false,
 
-            copyWiredLimitCommand() {
-                const text = this.memoryGuardWiredLimitCommand;
+            copyWiredLimitCommand(text = this.memoryGuardWiredLimitCommand) {
                 if (!text) return;
                 const onSuccess = () => {
                     this.wiredLimitCopied = true;
@@ -6694,6 +7393,217 @@
                 }
             },
 
+            // =================================================================
+            // Custom theme
+            // =================================================================
+            initCustomThemeEditor() {
+                if (this._customThemeReady) return;
+                this._customThemeReady = true;
+                this.customThemeDefaults = window.OmlxCustomTheme.defaults();
+                this.fillCustomThemeDraft();
+            },
+
+            fillCustomThemeDraft(theme = this.customThemeStored) {
+                const draft = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        draft[mode][token] = theme[mode]?.[token]
+                            || this.customThemeDefaults[mode][token] || '';
+                    }
+                }
+                this.customThemeDraft = draft;
+            },
+
+            get customThemeActive() {
+                return ['light', 'dark'].some(mode => Object.keys(this.customThemeStored[mode]).length > 0);
+            },
+
+            themeTokenValid(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token]) !== null;
+            },
+
+            themeTokenColor(mode, token) {
+                return window.OmlxCustomTheme.normalizeHex(this.customThemeDraft[mode]?.[token])
+                    || this.customThemeDefaults[mode][token] || '#000000';
+            },
+
+            themeTokenChanged(mode, token) {
+                return this.themeTokenColor(mode, token) !== this.customThemeDefaults[mode][token];
+            },
+
+            customThemeOverrides() {
+                const overrides = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        const color = this.themeTokenColor(mode, token);
+                        if (color !== this.customThemeDefaults[mode][token]) overrides[mode][token] = color;
+                    }
+                }
+                return overrides;
+            },
+
+            get customThemeDirty() {
+                return JSON.stringify(this.customThemeOverrides()) !== JSON.stringify(this.customThemeStored);
+            },
+
+            get customThemeInputsValid() {
+                return ['light', 'dark'].every(mode =>
+                    window.OmlxCustomTheme.TOKENS.every(token => this.themeTokenValid(mode, token))
+                    && this.themeContrastChecks(mode).every(check => check.ok));
+            },
+
+            // Column chrome uses stock colors so editing a surface never flips a column.
+            themeModeColor(mode, token) {
+                const stock = this.customThemeDefaults[mode] && this.customThemeDefaults[mode][token];
+                return stock || this.themeTokenColor(mode, token);
+            },
+
+            themeModeHeadStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `background:${color('bg-primary')}; border-color:${color('border-normal')}; color:${color('text-secondary')};`;
+            },
+
+            themeModeCellStyle(mode) {
+                const color = token => this.themeModeColor(mode, token);
+                return `--theme-cell-bg:${color('bg-primary')}; --theme-cell-fg:${color('text-primary')};`
+                    + ` --theme-cell-border:${color('border-normal')}; --theme-cell-placeholder:${color('text-muted')};`;
+            },
+
+            // Edited tokens also carry their derived channels and status tints.
+            themePreviewStyle(mode) {
+                const api = window.OmlxCustomTheme;
+                const stock = this.customThemeDefaults[mode];
+                const lines = api.DERIVED.map(token => `--${token}: ${stock[token]};`);
+                for (const token of api.TOKENS) {
+                    const color = this.themeTokenColor(mode, token);
+                    lines.push(...(color === stock[token]
+                        ? [`--${token}: ${color};`]
+                        : api.declarations(mode, token, color)));
+                }
+                return lines.join(' ');
+            },
+
+            // The only contrast check: the server stores any #rrggbb it gets.
+            themeContrastChecks(mode) {
+                const api = window.OmlxCustomTheme;
+                const colors = Object.fromEntries(api.TOKENS.map(token => [token, this.themeTokenColor(mode, token)]));
+                const lowest = {};
+                for (const { foreground, ratio } of api.contrastChecks(colors)) {
+                    lowest[foreground] = Math.min(lowest[foreground] ?? Infinity, ratio);
+                }
+                return Object.entries(lowest).map(([foreground, ratio]) => ({
+                    id: THEME_CONTRAST_LABELS[foreground],
+                    ratio,
+                    ok: ratio >= api.CONTRAST_FLOOR,
+                }));
+            },
+
+            normalizeThemeInput(mode, token) {
+                const text = String(this.customThemeDraft[mode][token] ?? '').trim();
+                if (!text) {
+                    this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+                    return;
+                }
+                const hex = window.OmlxCustomTheme.normalizeHex(text);
+                if (hex) this.customThemeDraft[mode][token] = hex;
+            },
+
+            resetThemeToken(mode, token) {
+                this.customThemeDraft[mode][token] = this.customThemeDefaults[mode][token];
+            },
+
+            focusThemeToken(mode, event) {
+                const token = event.target.closest('[data-token]')?.dataset.token;
+                const field = token && document.getElementById(`theme-token-${mode}-${token}`);
+                if (!field) return;
+                field.focus();
+                field.select();
+            },
+
+            async saveCustomTheme(overrides) {
+                const api = window.OmlxCustomTheme;
+                const theme = api.sanitize(overrides);
+                this.customThemeSaving = true;
+                this.customThemeError = '';
+                this.customThemeSaved = false;
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ui_custom_theme: api.isEmpty(theme) ? null : theme }),
+                    });
+                    if (!response.ok) throw new Error(await response.text() || response.statusText);
+                    const clean = api.apply(theme);
+                    this.customThemeStored = clean;
+                    window._customTheme = api.isEmpty(clean) ? null : clean;
+                    this.fillCustomThemeDraft();
+                    return true;
+                } catch (error) {
+                    this.customThemeError = window.t('settings.theme.save_failed');
+                    console.error('Failed to save custom theme:', error);
+                    return false;
+                } finally {
+                    this.customThemeSaving = false;
+                }
+            },
+
+            async applyCustomTheme() {
+                if (!this.customThemeInputsValid) return;
+                if (!(await this.saveCustomTheme(this.customThemeOverrides()))) return;
+                this.customThemeSaved = true;
+                clearTimeout(this._customThemeSavedTimer);
+                this._customThemeSavedTimer = setTimeout(() => { this.customThemeSaved = false; }, 2500);
+            },
+
+            discardCustomThemeDraft() {
+                this.customThemeError = '';
+                this.fillCustomThemeDraft();
+            },
+
+            // The full palette, so an agent sees every token, not only the overrides.
+            async copyCustomThemeJson() {
+                const theme = { light: {}, dark: {} };
+                for (const mode of ['light', 'dark']) {
+                    for (const token of window.OmlxCustomTheme.TOKENS) {
+                        theme[mode][token] = this.themeTokenColor(mode, token);
+                    }
+                }
+                this.customThemeJson = JSON.stringify(theme, null, 2);
+                this.customThemeJsonError = '';
+                try {
+                    await navigator.clipboard.writeText(this.customThemeJson);
+                } catch (error) {
+                    console.debug('Clipboard unavailable:', error);
+                }
+            },
+
+            // Fills the fields only; Apply still runs the contrast check.
+            importCustomThemeJson() {
+                const api = window.OmlxCustomTheme;
+                let clean;
+                try {
+                    clean = api.sanitize(JSON.parse(this.customThemeJson));
+                } catch (error) {
+                    clean = { light: {}, dark: {} };
+                }
+                if (api.isEmpty(clean)) {
+                    this.customThemeJsonError = window.t('settings.theme.json.invalid');
+                    return;
+                }
+                this.customThemeJsonError = '';
+                this.fillCustomThemeDraft(clean);
+            },
+
+            async resetCustomTheme() {
+                if (!window.confirm(window.t('settings.theme.restore_confirm'))) return;
+                await this.saveCustomTheme(null);
+            },
+
+            openCustomThemeSettings() {
+                this.setSettingsTab('theme');
+                window.scrollTo({ top: 0 });
+            },
+
             applyTheme() {
                 // Clean up existing listener
                 if (this.systemThemeListener) {
@@ -6757,8 +7667,44 @@
             // HuggingFace Downloader Functions
             // =================================================================
 
-            async startHFDownload() {
-                const repoId = this.hfRepoId.trim();
+            // Convert Hugging Face and configured mirror model URLs to owner/repo ids.
+            // Leave plain repository IDs and other input unchanged for model lookup.
+            hfRepoIdFromInput(value) {
+                const raw = String(value ?? '').trim();
+                const officialLink = /^(?:(?:https?:)?\/\/)?(?:www\.)?(?:huggingface\.co|hf\.co)\/([^/?#\s]+\/[^/?#\s]+)/i;
+                const officialMatch = raw.match(officialLink);
+                if (officialMatch) return officialMatch[1];
+
+                const endpoint = String(this.globalSettings?.huggingface?.endpoint ?? '').trim();
+                if (endpoint) {
+                    try {
+                        const mirror = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(endpoint)
+                            ? endpoint : `https://${endpoint}`);
+                        const escape = text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                        const prefix = mirror.pathname.split('/').filter(Boolean).map(escape).join('/');
+                        const pathPrefix = prefix ? `(?:${prefix}/)?` : '';
+                        const mirrorLink = new RegExp(
+                            `^(?:(?:https?:)?//)?(?:www\\.)?${escape(mirror.host)}/${pathPrefix}([^/?#\\s]+/[^/?#\\s]+)`,
+                            'i',
+                        );
+                        const mirrorMatch = raw.match(mirrorLink);
+                        if (mirrorMatch) return mirrorMatch[1];
+                    } catch {
+                        // Ignore invalid mirror settings and keep the official hosts.
+                    }
+                }
+                return raw;
+            },
+
+            startHFDownload() {
+                const repoId = this.hfRepoIdFromInput(this.hfRepoId);
+                if (!repoId) return;
+                this.hfRepoId = repoId;
+                this.openModelDetail(repoId, 'files');
+            },
+
+            async submitHFDownload(files) {
+                const repoId = this.hfModelDetail?.repo_id;
                 if (!repoId) return;
 
                 this.hfError = '';
@@ -6774,13 +7720,17 @@
                         body: JSON.stringify({
                             repo_id: repoId,
                             hf_token: this.hfToken,
+                            files,
                         }),
                         signal: controller.signal,
                     });
 
                     if (response.ok) {
+                        const { [repoId.toLowerCase()]: _done, ...updates } = this.hfUpdates;
+                        this.hfUpdates = updates;
                         this.hfSuccess = window.t('js.success.download_started').replace('{repo_id}', repoId);
-                        this.hfRepoId = '';
+                        if (this.hfRepoId.trim().toLowerCase() === repoId.toLowerCase()) this.hfRepoId = '';
+                        this.closeModelDetail();
                         await this.loadHFTasks();
                         this.startHFRefresh();
                         setTimeout(() => { this.hfSuccess = ''; }, 5000);
@@ -6842,6 +7792,61 @@
                     }
                 } catch (err) {
                     console.error('Failed to load HF models:', err);
+                }
+            },
+
+            // Folders the downloader writes, which an update check can compare.
+            get hfUpdateRepoIds() {
+                return this.hfModels
+                    .filter(m => m.repo_id && m.source_type === 'local')
+                    .map(m => m.repo_id);
+            },
+
+            hfUpdateFor(model) {
+                if (!model.repo_id || !this.isModelDownloaded(model.repo_id)) return null;
+                return this.hfUpdates[model.repo_id.toLowerCase()];
+            },
+
+            async checkHFUpdates() {
+                this.hfUpdatesChecking = true;
+                this.hfUpdatesStatus = '';
+                try {
+                    const response = await fetch('/admin/api/hf/updates', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ repo_ids: this.hfUpdateRepoIds, hf_token: this.hfToken }),
+                    });
+                    if (response.status === 401) {
+                        window.location.href = '/admin';
+                        return;
+                    }
+                    const data = response.ok ? await response.json() : null;
+                    if (!data || (data.checked && data.failed.length === data.checked)) {
+                        this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                        return;
+                    }
+                    if (!data.checked) {
+                        this.hfUpdatesStatus = window.t('models.manager.nothing_to_check');
+                        return;
+                    }
+                    const updates = {};
+                    for (const [repoId, info] of Object.entries(data.updates)) {
+                        updates[repoId.toLowerCase()] = info;
+                    }
+                    this.hfUpdates = updates;
+                    const count = Object.keys(updates).length;
+                    const status = [count
+                        ? window.t('models.manager.updates_found').replace('{count}', count)
+                        : window.t('models.manager.no_updates')];
+                    if (data.failed.length) {
+                        status.push(window.t('models.manager.update_check_partial').replace('{count}', data.failed.length));
+                    }
+                    this.hfUpdatesStatus = status.join(' · ');
+                } catch (err) {
+                    this.hfUpdatesStatus = window.t('models.manager.update_check_failed');
+                    console.error('Failed to check for model updates:', err);
+                } finally {
+                    this.hfUpdatesChecking = false;
                 }
             },
 
@@ -6930,8 +7935,18 @@
                 const pct = Math.round(task.progress || 0);
                 const dlGB = (task.downloaded_size / (1024 ** 3)).toFixed(1);
                 const totalGB = (task.total_size / (1024 ** 3)).toFixed(1);
-                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB`;
-                return `${base} \u00b7 ${this.formatSpeed(task)}`;
+                const base = `${pct}% \u00b7 ${dlGB} GB / ${totalGB} GB \u00b7 ${this.formatSpeed(task)}`;
+                const eta = this.formatEta(task.eta_seconds);
+                return eta ? `${base} \u00b7 ${eta}` : base;
+            },
+
+            formatEta(seconds) {
+                if (seconds == null) return '';
+                const h = Math.floor(seconds / 3600);
+                const m = Math.floor((seconds % 3600) / 60);
+                const s = seconds % 60;
+                const time = h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+                return window.t('models.queue.eta').replace('{time}', time);
             },
 
             formatSpeed(task) {
@@ -6981,6 +7996,7 @@
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                         mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
                             ? this.oqMtpAssistantPath : '',
+                        preserve_ngram_table: this.oqPreservesNgram(),
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
@@ -7128,9 +8144,13 @@
                 return model?.model_type || '';
             },
 
+            oqPreservesNgram() {
+                return this.oqSelectedModelType() === 'deepseek_v41' && this.oqPreserveNgram;
+            },
+
             oqAvailableLevels() {
                 return this.oqSelectedModelType() === 'deepseek_v41'
-                    ? [3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
+                    ? [2, 2.5, 2.7, 3, 4] : [2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8];
             },
 
             oqApplyModelPolicy() {
@@ -7199,6 +8219,7 @@
                             model_path: this.oqSelectedModelPath,
                             oq_level: this.oqLevel,
                             preserve_mtp: this.oqSelectedModelHasMtp() && this.oqPreserveMtp ? 'true' : 'false',
+                            preserve_ngram_table: this.oqPreservesNgram() ? 'true' : 'false',
                         });
                         const resp = await fetch(`/admin/api/oq/estimate?${params}`);
                         if (resp.ok) {
@@ -7371,7 +8392,7 @@
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
                 try {
-                    const response = await fetch(`/admin/api/hf/recommended?mlx_only=${this.hfMlxOnly}`, { signal: controller.signal });
+                    const response = await fetch(`/admin/api/hf/recommended?model_format=${this.hfModelFormat}`, { signal: controller.signal });
                     if (response.ok) {
                         const data = await response.json();
                         this.hfTokenInvalid = !!data.hf_token_invalid;
@@ -7407,9 +8428,281 @@
                 }
             },
 
+            // The GGUF model files a task fetches, shown beside its repo.
+            taskGgufFiles(task) {
+                return (task.gguf_files || []).join(', ');
+            },
+
+            // The model ID a finished download serves under.
+            taskModelId(task) {
+                return task.gguf_model_id || task.repo_id.split('/').pop();
+            },
+
+            // Every download picks its files in the detail modal first.
             downloadRecommended(repoId) {
-                this.hfRepoId = repoId;
-                this.startHFDownload();
+                this.openModelDetail(repoId, 'files');
+            },
+
+            isModelDownloaded(repoId) {
+                if (!repoId) return false;
+                const wanted = repoId.toLowerCase();
+                const matches = item => item.repo_id?.toLowerCase() === wanted;
+                // A cancelled or failed download keeps its finished files for resume.
+                const unfinished = [this.hfTasks, this.msTasks].some(tasks => {
+                    const latest = tasks.findLast(matches);
+                    return latest && latest.status !== 'completed';
+                });
+                return !unfinished && this.hfModels.some(matches);
+            },
+
+            // =================================================================
+            // First-run banner
+            // =================================================================
+
+            get hasUserModels() {
+                return this.models.some(m => !m.virtual && !m.is_helper);
+            },
+
+            get onboardingTask() {
+                return this.hfTasks.find(t => t.status === 'pending' || t.status === 'downloading') || null;
+            },
+
+            get onboardingState() {
+                if (!this.onboardingStartedEmpty) return null;
+                if (this.onboardingTask) return 'downloading';
+                if (this.hasUserModels) return this.onboardingReadyDismissed ? null : 'ready';
+                return this.onboardingDismissed ? null : 'first';
+            },
+
+            get onboardingReadyName() {
+                const model = this.models.find(m => !m.virtual && !m.is_helper);
+                return model ? (model.display_name || model.id) : '';
+            },
+
+            // =================================================================
+            // Recommended models (hardware-aware oQ picks)
+            // =================================================================
+
+            async loadRecommendations(force = false) {
+                if (this.recommendationsLoading || (this.recommendations && !force)) return;
+                this.recommendationsLoading = true;
+                this.recommendationsError = '';
+                try {
+                    const response = await fetch('/admin/api/hf/recommendations');
+                    if (response.ok) {
+                        this.recommendations = await response.json();
+                    } else if (response.status === 401) {
+                        window.location.href = '/admin';
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.recommendationsError = data.detail || window.t('models.recommend.error');
+                    }
+                } catch (err) {
+                    this.recommendationsError = window.t('models.recommend.error');
+                    console.error('Failed to load recommendations:', err);
+                } finally {
+                    this.recommendationsLoading = false;
+                }
+            },
+
+            recGB(bytes) {
+                const gb = (bytes || 0) / 1024 ** 3;
+                return (gb >= 100 ? Math.round(gb) : gb.toFixed(1)) + ' GB';
+            },
+
+            recContext(tokens) {
+                if (tokens >= 1024 * 1024) return Math.round(tokens / (1024 * 1024)) + 'M';
+                return Math.round(tokens / 1024) + 'K';
+            },
+
+            recParams(count) {
+                const b = count / 1e9;
+                return (b >= 10 ? Math.round(b) : b.toFixed(1)) + 'B';
+            },
+
+            recArch(item) {
+                if (!item.moe) {
+                    return window.t('models.recommend.arch.dense').replace('{total}', this.recParams(item.total_params));
+                }
+                return window.t('models.recommend.arch.moe')
+                    .replace('{total}', this.recParams(item.total_params))
+                    .replace('{active}', this.recParams(item.active_params));
+            },
+
+            recDownloadsText(item) {
+                return window.t('models.recommend.meta.downloads').replace('{count}', this.formatDownloads(item.downloads));
+            },
+
+            recDots(level) {
+                return [1, 2, 3, 4, 5].map(i => (i <= level ? 'full' : (i - 0.5 === level ? 'half' : 'empty')));
+            },
+
+            // Share of the budget a row's weights take. Unlock rows use the raised budget.
+            recMemoryShare(item) {
+                const scenarios = this.recommendations.memory.scenarios;
+                const usable = (item.kind ? scenarios.both : scenarios.now).usable_bytes;
+                return usable > 0 ? Math.min(100, Math.round(item.resident_bytes / usable * 100)) : 100;
+            },
+
+            // Roomy, getting full, tight.
+            recMemoryBarClass(item) {
+                const share = this.recMemoryShare(item);
+                if (share >= 85) return 'bg-red-400';
+                if (share >= 60) return 'bg-orange-300';
+                return 'bg-emerald-400';
+            },
+
+            recSpeedVs(item) {
+                const ratio = item.relative_speed;
+                const fmt = r => (r >= 10 ? r.toFixed(0) : r.toFixed(1));
+                if (ratio > 1.1) {
+                    return window.t('models.recommend.relative.faster')
+                        .replace('{ratio}', fmt(ratio)).replace('{name}', item.base_name);
+                }
+                if (ratio < 0.9) {
+                    return window.t('models.recommend.relative.slower')
+                        .replace('{ratio}', fmt(1 / ratio)).replace('{name}', item.base_name);
+                }
+                return window.t('models.recommend.relative.similar').replace('{name}', item.base_name);
+            },
+
+            recNote(group, item) {
+                if (group === 'bigger') {
+                    return window.t('models.recommend.note.bigger')
+                        .replace('{total}', this.recParams(item.total_params)).replace('{speed}', this.recSpeedVs(item));
+                }
+                if (group === 'precise') {
+                    return window.t('models.recommend.note.precise').replace('{speed}', this.recSpeedVs(item));
+                }
+                if (group === 'faster') {
+                    return window.t('models.recommend.note.faster').replace('{speed}', this.recSpeedVs(item));
+                }
+                if (item.kind === 'table_in_memory') {
+                    return window.t('models.recommend.note.table_in_memory').replace('{speed}', this.recSpeedVs(item));
+                }
+                const best = this.recommendations.sections.best;
+                const smartest = Math.max(...best.map(b => b.smarts), -Infinity);
+                return window.t(item.smarts > smartest
+                    ? 'models.recommend.note.smarter_than_best'
+                    : 'models.recommend.note.larger_build');
+            },
+
+            recBiggerEmptyText() {
+                const best = this.recommendations.sections.best;
+                const smartest = Math.max(...best.map(b => b.smarts), -Infinity);
+                const names = this.recommendations.sections.unlock
+                    .filter(u => u.kind === 'fits' && u.smarts > smartest && !best.some(b => b.name === u.name))
+                    .map(u => `${u.name} oQ${u.level}e`);
+                if (!names.length) return window.t('models.recommend.bigger.empty');
+                return window.t('models.recommend.bigger.empty_unlock').replace('{models}', names.join(', '));
+            },
+
+            recTask(repoId) {
+                const wanted = repoId.toLowerCase();
+                return this.hfTasks.findLast(t => t.repo_id?.toLowerCase() === wanted);
+            },
+
+            recState(repoId) {
+                const task = this.recTask(repoId);
+                if (task && (task.status === 'pending' || task.status === 'downloading')) return 'downloading';
+                return this.isModelDownloaded(repoId) ? 'downloaded' : 'idle';
+            },
+
+            recDiskShort(item) {
+                const free = this.recommendations?.disk?.free_bytes || 0;
+                return free > 0 && item.download_bytes > free;
+            },
+
+            recChipLine() {
+                const device = this.recommendations.device;
+                if (!device.gpu_cores) return device.chip;
+                return device.chip + ' · ' + window.t('models.recommend.gpu_cores').replace('{cores}', device.gpu_cores);
+            },
+
+            recMemoryLine() {
+                return window.t('models.recommend.memory_line')
+                    .replace('{memory}', this.recGB(this.recommendations.memory.total_bytes))
+                    .replace('{bandwidth}', this.recommendations.device.bandwidth_gbps);
+            },
+
+            recGpuLimitText() {
+                const memory = this.recommendations.memory;
+                const key = memory.wired_limit_set ? 'models.recommend.chip.gpu_limit_set' : 'models.recommend.chip.gpu_limit_default';
+                return window.t(key).replace('{size}', this.recGB(memory.scenarios.now.metal_cap_bytes));
+            },
+
+            // Total RAM split into what models get and what holds them back.
+            recMemorySegments() {
+                const memory = this.recommendations.memory;
+                const now = memory.scenarios.now;
+                return [
+                    { key: 'usable', bytes: now.usable_bytes, cls: 'bg-emerald-500', label: 'models.recommend.bar.usable' },
+                    { key: 'headroom', bytes: now.ceiling_bytes - now.usable_bytes, cls: 'bg-emerald-500/30', label: 'models.recommend.bar.headroom' },
+                    { key: 'gpu', bytes: memory.static_ceiling_bytes - now.ceiling_bytes, cls: 'bg-amber-500/40', label: 'models.recommend.bar.gpu_limit' },
+                    // A custom memory guard ceiling below what the tier reserve allows.
+                    { key: 'custom', bytes: memory.total_bytes - memory.reserve_bytes - memory.static_ceiling_bytes, cls: 'bg-neutral-200', label: 'models.recommend.bar.custom_limit' },
+                    { key: 'reserve', bytes: memory.reserve_bytes, cls: 'bg-neutral-300', label: 'models.recommend.bar.reserve' },
+                ]
+                    .filter(segment => segment.bytes > 64 * 1024 ** 2)
+                    .map(segment => ({ ...segment, percent: segment.bytes / memory.total_bytes * 100 }));
+            },
+
+            recUnlockOpen() {
+                if (this.recommendationsUnlockOpen !== null) return this.recommendationsUnlockOpen;
+                return (this.recommendations?.memory?.total_bytes || 0) > 16 * 1024 ** 3;
+            },
+
+            recUnlockGain(key) {
+                const scenarios = this.recommendations.memory.scenarios;
+                const gain = scenarios[key].usable_bytes - scenarios.now.usable_bytes;
+                return gain > 256 * 1024 ** 2 ? gain : 0;
+            },
+
+            recAggressiveReserve() {
+                return this.recommendations.memory.aggressive_reserve_bytes;
+            },
+
+            recMetalPercent() {
+                const memory = this.recommendations.memory;
+                return Math.round(memory.scenarios.now.metal_cap_bytes / memory.total_bytes * 100);
+            },
+
+            recWiredCommand() {
+                const memory = this.recommendations.memory;
+                const mb = memory.suggested_wired_limit_mb;
+                if (!memory.guard_enabled || mb * 1024 ** 2 <= memory.scenarios.now.metal_cap_bytes) return '';
+                return `sudo sysctl iogpu.wired_limit_mb=${mb}`;
+            },
+
+            recUnlockSummary() {
+                const memory = this.recommendations.memory;
+                const both = memory.scenarios.both;
+                return window.t('models.recommend.unlock.summary')
+                    .replace('{usable}', this.recGB(both.usable_bytes))
+                    .replace('{now}', this.recGB(memory.scenarios.now.usable_bytes))
+                    .replace('{free}', this.recGB(memory.total_bytes - both.ceiling_bytes));
+            },
+
+            async recSetAggressive() {
+                this.recommendationsApplying = true;
+                try {
+                    const response = await fetch('/admin/api/global-settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ memory_guard_tier: 'aggressive' }),
+                    });
+                    if (response.ok) {
+                        this.globalSettings.memory.memory_guard_tier = 'aggressive';
+                        await this.loadRecommendations(true);
+                    } else {
+                        const data = await response.json().catch(() => ({}));
+                        this.hfError = data.detail || window.t('models.recommend.error');
+                    }
+                } catch (err) {
+                    console.error('Failed to switch the memory guard tier:', err);
+                } finally {
+                    this.recommendationsApplying = false;
+                }
             },
 
             getMemoryFitStatus(sizeBytes) {
@@ -7422,8 +8715,8 @@
             },
 
             formatDownloads(count) {
-                const chinese = chineseCount(count);
-                if (chinese !== null) return chinese;
+                const compact = window.omlxCount?.eastAsian?.(count);
+                if (compact != null) return compact;
                 if (count >= 1000000) return (count / 1000000).toFixed(1) + 'M';
                 if (count >= 1000) return (count / 1000).toFixed(1) + 'K';
                 return count.toString();
@@ -7521,7 +8814,7 @@
                         q: this.hfSearchQuery,
                         sort: this.hfSearchSort,
                         limit: '100',
-                        mlx_only: this.hfMlxOnly,
+                        model_format: this.hfModelFormat,
                     });
                     // Add filter parameters if set. Sizes use binary GiB to match
                     // _format_model_size on the backend.
@@ -7616,30 +8909,40 @@
             },
 
             // Model detail modal
-            async openModelDetail(repoId) {
+            async openModelDetail(repoId, tab = 'card') {
                 this.hfModelDetailLoading = true;
                 this.hfModelDetail = null;
+                this.hfDetailTab = tab;
+                this.hfSelectedFiles = {};
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 15000);
+                // A download still starts when the file list does not load.
+                const unavailable = (message) => {
+                    if (tab !== 'files') {
+                        this.hfError = message;
+                        setTimeout(() => { this.hfError = ''; }, 5000);
+                        return;
+                    }
+                    this.hfModelDetail = { repo_id: repoId, files: [], tags: [], layout: 'other',
+                                           downloads: 0, likes: 0, download_all_size: 0,
+                                           unavailable: message };
+                };
                 try {
                     const params = new URLSearchParams({ repo_id: repoId });
-                    const response = await fetch(`/admin/api/hf/model-info?${params}`, { signal: controller.signal });
+                    const headers = this.hfToken ? { 'X-HF-Token': this.hfToken } : {};
+                    const response = await fetch(`/admin/api/hf/model-info?${params}`, { headers, signal: controller.signal });
                     if (response.ok) {
                         this.hfModelDetail = await response.json();
+                        this.resetHfSelection();
                     } else if (response.status === 401) {
                         window.location.href = '/admin';
                     } else {
                         const data = await response.json().catch(() => ({}));
-                        this.hfError = data.detail || window.t('js.error.fetch_model_info_failed');
-                        setTimeout(() => { this.hfError = ''; }, 5000);
+                        unavailable(data.detail || window.t('js.error.fetch_model_info_failed'));
                     }
                 } catch (err) {
-                    if (err.name === 'AbortError') {
-                        this.hfError = window.t('js.error.hf_timeout');
-                    } else {
-                        this.hfError = window.t('js.error.hf_connect_failed');
-                    }
-                    setTimeout(() => { this.hfError = ''; }, 5000);
+                    unavailable(err.name === 'AbortError'
+                        ? window.t('js.error.hf_timeout') : window.t('js.error.hf_connect_failed'));
                     console.error('Failed to fetch model info:', err);
                 } finally {
                     clearTimeout(timeoutId);
@@ -7652,6 +8955,82 @@
                 this.hfModelDetailLoading = false;
                 this.msModelDetail = null;
                 this.msModelDetailLoading = false;
+            },
+
+            // A selection starts from what "download all" fetches (nothing for GGUF repos) and changed local files.
+            resetHfSelection() {
+                const picked = {};
+                for (const file of this.hfModelDetail?.files || []) {
+                    if ((file.preselected || file.outdated) && !file.local) picked[file.name] = true;
+                }
+                this.hfSelectedFiles = picked;
+            },
+
+            isHfFileLocked(file) {
+                return file.required || file.local;
+            },
+
+            isHfFileSelected(file) {
+                return !file.local && (file.required || !!this.hfSelectedFiles[file.name]);
+            },
+
+            // A split GGUF's parts toggle together; a GGUF brings its vision projector.
+            toggleHfFile(file) {
+                if (this.isHfFileLocked(file)) return;
+                const files = this.hfModelDetail.files;
+                const on = !this.hfSelectedFiles[file.name];
+                const picked = { ...this.hfSelectedFiles };
+                const members = file.group ? files.filter(f => f.group === file.group) : [file];
+                for (const member of members) {
+                    if (!member.local) picked[member.name] = on;
+                }
+                const projector = on && file.mmproj && files.find(f => f.name === file.mmproj);
+                if (projector && !projector.local) picked[projector.name] = true;
+                this.hfSelectedFiles = picked;
+            },
+
+            hfSelectedNames() {
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => this.isHfFileSelected(file))
+                    .map(file => file.name);
+            },
+
+            // A downloaded checkpoint with Hub changes offers Update instead of the download buttons.
+            hfShowsUpdate() {
+                const detail = this.hfModelDetail;
+                return !!(detail && !detail.is_adapter && !detail.unsupported_reason && detail.layout !== 'gguf'
+                    && detail.update_files?.length && this.isModelDownloaded(detail.repo_id));
+            },
+
+            hfUpdateSize() {
+                const names = new Set(this.hfModelDetail?.update_files || []);
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => names.has(file.name))
+                    .reduce((total, file) => total + (file.size || 0), 0);
+            },
+
+            hfSelectionSize() {
+                return (this.hfModelDetail?.files || [])
+                    .filter(file => this.isHfFileSelected(file))
+                    .reduce((total, file) => total + (file.size || 0), 0);
+            },
+
+            // A split GGUF loads as one model: size the whole set.
+            hfFileSize(file) {
+                if (!file.group) return file.size || 0;
+                return this.hfModelDetail.files
+                    .filter(f => f.group === file.group)
+                    .reduce((total, f) => total + (f.size || 0), 0);
+            },
+
+            // What "download all" still has to fetch: its files not downloaded yet.
+            hfDownloadAllSize() {
+                return this.hfModelDetail?.download_all_size || 0;
+            },
+
+            hfFitsDisk(bytes) {
+                const free = this.hfModelDetail?.disk_free;
+                return !free || bytes <= free;
             },
 
             formatFileSize(bytes) {

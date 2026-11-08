@@ -18,8 +18,13 @@ from unittest.mock import MagicMock, patch
 import mlx.core as mx
 import pytest
 from mlx.utils import tree_flatten
+from mlx_embeddings.models.siglip import Model as Siglip
+from mlx_embeddings.models.siglip import ModelArgs as SiglipArgs
+from mlx_embeddings.models.siglip import TextConfig as SiglipTextConfig
+from mlx_embeddings.models.siglip import VisionConfig as SiglipVisionConfig
 from mlx_vlm.models.embedding_gemma2 import Model as EmbeddingGemma2
 from mlx_vlm.models.embedding_gemma2 import ModelConfig as EmbeddingGemma2Config
+from PIL import Image
 from safetensors.numpy import save_file
 
 from omlx.api.embedding_models import (
@@ -106,6 +111,14 @@ class TestEmbeddingModels:
         """Test max_length must be a positive integer."""
         with pytest.raises(ValueError, match="greater than 0"):
             EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", max_length=0)
+
+    def test_embedding_request_rejects_non_positive_dimensions(self):
+        """dimensions=0 returned the full-length vector and -1 silently
+        truncated from the end; both must fail validation like max_length."""
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=0)
+        with pytest.raises(ValueError, match="greater than 0"):
+            EmbeddingRequest(input="Hello", model="all-MiniLM-L6-v2", dimensions=-1)
 
     def test_embedding_request_items_input(self):
         """Test EmbeddingRequest with structured items."""
@@ -267,6 +280,89 @@ class TestEmbeddingUtils:
         """Test normalizing list input."""
         result = normalize_input(["Hello", "World"])
         assert result == ["Hello", "World"]
+
+    def test_normalize_input_image_content_parts(self):
+        """OpenAI image_url content parts fold into one structured item."""
+        parts = [
+            {"type": "text", "text": "a diagram"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [{"text": "a diagram", "image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_image_only_content_parts(self):
+        """Image-only parts produce an item without a text key."""
+        parts = [{"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}}]
+        assert normalize_input(parts) == [{"image": IMAGE_DATA_URI}]
+
+    def test_normalize_input_multiple_text_parts_join(self):
+        """Several text parts join with newlines, like extract_text_from_content."""
+        parts = [
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "one\ntwo", "image": IMAGE_DATA_URI}
+        ]
+
+    def test_normalize_input_audio_content_part(self):
+        """input_audio parts fold into the data-URI form items take."""
+        parts = [
+            {"type": "text", "text": "speech"},
+            {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        ]
+        assert normalize_input(parts) == [
+            {"text": "speech", "audio": "data:audio/wav;base64,AAAA"}
+        ]
+
+    def test_normalize_input_rejects_two_images(self):
+        parts = [
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="at most one image"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_unknown_part_type(self):
+        parts = [{"type": "file", "file": {"filename": "x.pdf"}}]
+        with pytest.raises(InvalidRequestError, match="Unsupported embedding content part"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_image_part_without_url(self):
+        parts = [{"type": "image_url", "image_url": {}}]
+        with pytest.raises(InvalidRequestError, match="requires a non-empty url"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_empty_parts(self):
+        with pytest.raises(InvalidRequestError, match="no text, image, or audio"):
+            normalize_input([{"type": "text", "text": ""}])
+
+    def test_normalize_input_rejects_strings_mixed_with_parts(self):
+        """A string batch must not silently fuse into one vector."""
+        parts = [
+            "doc one",
+            "doc two",
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="cannot mix plain strings"):
+            normalize_input(parts)
+
+    def test_normalize_input_rejects_null_text_part(self):
+        parts = [
+            {"type": "text", "text": None},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        with pytest.raises(InvalidRequestError, match="'text' requires a string"):
+            normalize_input(parts)
+
+    def test_embedding_request_accepts_content_parts(self):
+        """EmbeddingRequest keeps OpenAI content-part input verbatim."""
+        parts = [
+            {"type": "text", "text": "hello"},
+            {"type": "image_url", "image_url": {"url": IMAGE_DATA_URI}},
+        ]
+        request = EmbeddingRequest(input=parts, model="test-model")
+        assert request.input == parts
 
     def test_normalize_embedding_items(self):
         """Test structured embedding items normalization."""
@@ -515,6 +611,31 @@ class TestEmbeddingCompileFallback:
             model.embed(["test"])
 
         assert generate.call_args.kwargs["max_length"] == 40960
+
+    def test_eager_usage_counts_tokens_left_after_truncation(self):
+        """generate() returns no mask, so usage is counted from the text."""
+        model = MLXEmbeddingModel("test-model")
+        model._loaded = True
+        model._is_compiled = False
+        model._compiled_embed = None
+        model.model = MagicMock()
+        model.processor = MagicMock(spec=["encode"])
+        model.processor.encode.side_effect = lambda text, add_special_tokens: (
+            text.split()
+        )
+
+        mock_outputs = MagicMock(spec=[])
+        mock_outputs.text_embeds = mx.array([[0.5, 0.6], [0.1, 0.2]])
+        mock_outputs.pooler_output = None
+        mock_outputs.last_hidden_state = None
+
+        texts = [" ".join(["w"] * 100), "a b c"]
+        with patch("mlx_embeddings.generate", return_value=mock_outputs):
+            truncated = model.embed(texts, max_length=8)
+            full = model.embed(texts, max_length=8, truncation=False)
+
+        assert truncated.total_tokens == 8 + 3
+        assert full.total_tokens == 100 + 3
 
     def test_default_max_length_uses_tokenizer_config_fallback(self):
         """Tokenizer model_max_length is used when model config lacks a limit."""
@@ -2427,3 +2548,110 @@ class TestMlxVlmEmbeddingGemma2:
         model.embed([{"text": "a cat", "image": IMAGE_DATA_URI}])
 
         assert "audio_kwargs" not in processor.apply_chat_template.call_args.kwargs
+
+
+
+class TestSiglipEmbedding:
+    """SigLIP embeds text and images with separate towers."""
+
+    class MockTokenizer:
+        """Pads to max_length and records the call kwargs."""
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, texts, **kwargs):
+            self.calls.append(kwargs)
+            length = kwargs["max_length"]
+            encoded = [[3 + len(word) % 20 for word in t.split()] + [1] for t in texts]
+            input_ids = [ids + [0] * (length - len(ids)) for ids in encoded]
+            mask = [[1] * len(ids) + [0] * (length - len(ids)) for ids in encoded]
+            return {"input_ids": mx.array(input_ids), "attention_mask": mx.array(mask)}
+
+    class MockProcessor:
+        """Like SiglipProcessor, __call__ takes images first."""
+
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+        def __call__(self, images=None, text=None, **kwargs):
+            raise AssertionError("text reached the processor's images argument")
+
+        @staticmethod
+        def image_processor(images, return_tensors):
+            pixels = [np.asarray(img, dtype=np.float32) / 127.5 - 1 for img in images]
+            return {"pixel_values": np.stack(pixels).transpose(0, 3, 1, 2)}
+
+    @staticmethod
+    def _image(color):
+        return Image.new("RGB", (32, 32), color)
+
+    def _uri(self, color):
+        buffer = io.BytesIO()
+        self._image(color).save(buffer, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+
+    def _load(self, tmp_path):
+        args = SiglipArgs(
+            text_config=SiglipTextConfig(
+                vocab_size=32,
+                max_position_embeddings=8,
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=1,
+            ),
+            vision_config=SiglipVisionConfig(
+                image_size=32,
+                patch_size=16,
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=1,
+            ),
+        )
+        siglip = Siglip(args)
+        mx.eval(siglip.parameters())
+        tokenizer = self.MockTokenizer()
+        model = MLXEmbeddingModel(str(tmp_path))
+        with patch(
+            "mlx_embeddings.load", return_value=(siglip, self.MockProcessor(tokenizer))
+        ):
+            model.load()
+        return model, siglip, tokenizer
+
+    def test_text_and_image_items_use_their_own_tower(self, tmp_path):
+        model, siglip, tokenizer = self._load(tmp_path)
+        texts = ["a red square", "a blue circle"]
+        items = [
+            {"text": texts[0]},
+            {"image": self._uri("red")},
+            {"text": texts[1]},
+            {"image": self._uri("blue")},
+        ]
+
+        output = model.embed(items)
+
+        assert [(c["padding"], c["max_length"]) for c in tokenizer.calls] == [
+            ("max_length", 8)
+        ]
+        tokens = tokenizer(texts, max_length=8)
+        text = siglip.get_text_features(input_ids=tokens["input_ids"])
+        pixels = self.MockProcessor.image_processor(
+            [self._image("red"), self._image("blue")], return_tensors="np"
+        )["pixel_values"]
+        image = siglip.get_image_features(pixel_values=mx.array(pixels))
+        text = np.array(text / mx.linalg.norm(text, axis=-1, keepdims=True))
+        image = np.array(image / mx.linalg.norm(image, axis=-1, keepdims=True))
+        np.testing.assert_allclose(
+            np.array(output.embeddings),
+            np.stack([text[0], image[0], text[1], image[1]]),
+            atol=1e-5,
+        )
+        assert output.total_tokens == int(tokens["attention_mask"].sum())
+
+    def test_text_and_image_in_one_item_is_rejected(self, tmp_path):
+        model, _, _ = self._load(tmp_path)
+
+        with pytest.raises(ValueError, match="separately"):
+            model.embed([{"text": "a red square", "image": self._uri("red")}])

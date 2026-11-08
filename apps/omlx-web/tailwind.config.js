@@ -1,11 +1,11 @@
 /** @type {import('tailwindcss').Config} */
 module.exports = {
+  darkMode: ['selector', '[data-theme="dark"]'],
   content: [
     "./omlx_web/templates/**/*.html",
     "./omlx_web/static/js/**/*.js",
   ],
   safelist: [
-    "sm:grid-cols-2",  // dynamic :class in _modal_model_settings.html
     "max-w-[90rem]", "max-w-[100rem]", "max-w-none",  // dashboardWidthClass in dashboard_layout.js
     "bg-emerald-500", "text-white", "border-emerald-500",
     "bg-emerald-50", "text-emerald-700", "border-emerald-200", "hover:bg-emerald-100",
@@ -18,6 +18,40 @@ module.exports = {
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
+      },
+      // Neutral utilities read the theme.css channels (dark values in
+      // dashboard.css). text-400 takes the 500 step for AA (#4727).
+      textColor: {
+        neutral: {
+          300: 'rgb(var(--text-scale-300) / <alpha-value>)',
+          400: 'rgb(var(--text-scale-400) / <alpha-value>)',
+          500: 'rgb(var(--text-scale-500) / <alpha-value>)',
+          600: 'rgb(var(--text-scale-600) / <alpha-value>)',
+          700: 'rgb(var(--text-scale-700) / <alpha-value>)',
+          800: 'rgb(var(--text-scale-800) / <alpha-value>)',
+          900: 'rgb(var(--text-scale-900) / <alpha-value>)',
+        },
+      },
+      backgroundColor: {
+        white: 'rgb(var(--surface-scale-white) / <alpha-value>)',
+        neutral: {
+          50: 'rgb(var(--surface-scale-50) / <alpha-value>)',
+          100: 'rgb(var(--surface-scale-100) / <alpha-value>)',
+          200: 'rgb(var(--surface-scale-200) / <alpha-value>)',
+        },
+      },
+      borderColor: {
+        neutral: {
+          100: 'rgb(var(--border-scale-100) / <alpha-value>)',
+          200: 'rgb(var(--border-scale-200) / <alpha-value>)',
+          300: 'rgb(var(--border-scale-300) / <alpha-value>)',
+        },
+      },
+      gradientColorStops: {
+        neutral: {
+          50: 'rgb(var(--surface-scale-50) / <alpha-value>)',
+          100: 'rgb(var(--surface-scale-100) / <alpha-value>)',
+        },
       },
       // Tailwind's palette resolves through the tokens in static/css/theme.css.
       colors: {
